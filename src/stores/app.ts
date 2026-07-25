@@ -34,7 +34,7 @@ const BROWSER_PREVIEW_FALLBACK: AppConfig = {
       name: "Tokyo Preview",
       host: "preview.example.net",
       port: 8388,
-      method: "2022-blake3-aes-256-gcm",
+      method: "2022-blake3-chacha20-poly1305",
       password: "browser-preview-only",
       timeout: 300,
       plugin: null,

@@ -4,6 +4,11 @@ use std::fmt;
 
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "config.json";
+pub const SUPPORTED_METHODS: [&str; 3] = [
+    "2022-blake3-chacha20-poly1305",
+    "chacha20-ietf-poly1305",
+    "xchacha20-ietf-poly1305",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -115,7 +120,7 @@ impl Default for ServerProfile {
             host: String::new(),
             port: 8388,
             password: String::new(),
-            method: "2022-blake3-aes-256-gcm".to_owned(),
+            method: SUPPORTED_METHODS[0].to_owned(),
             timeout: 300,
             plugin: None,
             plugin_opts: None,
@@ -274,7 +279,9 @@ impl ServerProfile {
         if self.password.is_empty() || self.password.len() > 4096 {
             return Err(ValidationError::new("server password is invalid"));
         }
-        validate_short_text(&self.method, "encryption method is invalid", false)?;
+        if !SUPPORTED_METHODS.contains(&self.method.as_str()) {
+            return Err(ValidationError::new("encryption method is not supported"));
+        }
         if !(1..=86_400).contains(&self.timeout) {
             return Err(ValidationError::new(
                 "server timeout must be between 1 and 86400 seconds",
@@ -366,7 +373,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 8388,
             password: "do-not-expose-this".to_owned(),
-            method: "aes-256-gcm".to_owned(),
+            method: "2022-blake3-chacha20-poly1305".to_owned(),
             group: "Test".to_owned(),
             ..ServerProfile::default()
         }
@@ -413,5 +420,23 @@ mod tests {
         let debug = format!("{server:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains(&server.password));
+    }
+
+    #[test]
+    fn only_explicitly_supported_encryption_methods_are_accepted() {
+        for method in SUPPORTED_METHODS {
+            let mut server = valid_server();
+            server.method = method.to_owned();
+            server.validate().unwrap();
+        }
+
+        for method in ["aes-256-gcm", "2022-blake3-aes-256-gcm", "plain"] {
+            let mut server = valid_server();
+            server.method = method.to_owned();
+            assert_eq!(
+                server.validate().unwrap_err().to_string(),
+                "encryption method is not supported"
+            );
+        }
     }
 }

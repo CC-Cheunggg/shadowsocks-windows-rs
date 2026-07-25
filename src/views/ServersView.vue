@@ -11,7 +11,7 @@ const form = reactive({
   host: "",
   port: 8388,
   password: "",
-  method: "2022-blake3-aes-256-gcm",
+  method: "2022-blake3-chacha20-poly1305",
   timeout: 300,
   group: "Personal",
   plugin: "",
@@ -52,7 +52,7 @@ async function saveServer() {
     host: "",
     port: 8388,
     password: "",
-    method: "2022-blake3-aes-256-gcm",
+    method: "2022-blake3-chacha20-poly1305",
     timeout: 300,
     group: "Personal",
     plugin: "",
@@ -163,11 +163,9 @@ async function saveServer() {
           <label>
             <span>加密方式</span>
             <select v-model="form.method">
-              <option>2022-blake3-aes-256-gcm</option>
               <option>2022-blake3-chacha20-poly1305</option>
               <option>chacha20-ietf-poly1305</option>
-              <option>aes-256-gcm</option>
-              <option>aes-128-gcm</option>
+              <option>xchacha20-ietf-poly1305</option>
             </select>
           </label>
           <label class="form-grid__wide">

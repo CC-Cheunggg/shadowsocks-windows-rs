@@ -340,7 +340,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             port: 8388,
             password: "test-secret-that-must-not-leak".to_owned(),
-            method: "aes-256-gcm".to_owned(),
+            method: "2022-blake3-chacha20-poly1305".to_owned(),
             timeout: 300,
             plugin: None,
             plugin_opts: None,

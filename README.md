@@ -16,6 +16,8 @@ registration, cloud accounts, telemetry, or copied code and visual assets from
 - Versioned JSON configuration (`version: 1`)
 - Shadowsocks server profiles with host, port, password, method, timeout,
   plugin, plugin options, group, and source
+- An explicit cipher allowlist limited to `2022-blake3-chacha20-poly1305`,
+  `chacha20-ietf-poly1305`, and `xchacha20-ietf-poly1305`
 - Direct, rule, and global connection-mode model
 - DNS configuration model
 - Placeholder TUN and Kill Switch configuration models
@@ -25,6 +27,8 @@ registration, cloud accounts, telemetry, or copied code and visual assets from
 - Automatic backup and default recovery for malformed or invalid configuration
 - Restricted Tauri commands for reading/saving configuration and adding,
   updating, deleting, or selecting a server
+- Separated Rust modules for configuration models, persistence, and Tauri
+  command boundaries
 - Browser-only, visibly labelled preview data for frontend development
 - Rust tests for defaults, validation, loading, saving, mutation persistence,
   and corrupt-file recovery
