@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Shadowsocks",
+  "version": "0.1.0",
+  "identifier": "dev.shadowsocks-windows-rs.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Shadowsocks",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 980,
+        "minHeight": 640,
+        "center": true,
+        "decorations": true,
+        "transparent": false,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "img-src": "'self' asset: http://asset.localhost data:",
+        "style-src": "'self' 'unsafe-inline'"
+      }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "copyright": "Copyright © 2026 Shadowsocks Windows RS contributors",
+    "category": "Utility",
+    "shortDescription": "A modern Windows Shadowsocks client",
+    "longDescription": "A modern, open-source Windows Shadowsocks client powered by Vue, Tauri, and Rust."
+  }
+}
