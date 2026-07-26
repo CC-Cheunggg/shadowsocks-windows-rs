@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "resources/wintun/amd64/wintun.dll": "wintun.dll",
+      "../third_party/wintun/LICENSE.txt": "WINTUN-LICENSE.txt"
+    }
+  }
+}

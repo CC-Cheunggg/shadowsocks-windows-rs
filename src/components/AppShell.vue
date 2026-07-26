@@ -1,15 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { computed, onMounted } from "vue";
 import { useRoute } from "vue-router";
-import type { RuntimeSnapshot } from "@/domain/models";
 import { useAppStore } from "@/stores/app";
 import AppIcon from "./AppIcon.vue";
 import AppLogo from "./AppLogo.vue";
 
 const app = useAppStore();
 const route = useRoute();
-const runtime = ref<RuntimeSnapshot | null>(null);
 
 const navigation = [
   { label: "概览", name: "overview", icon: "overview" },
@@ -27,18 +24,21 @@ const currentLabel = computed(
     (route.name === "settings" ? "设置" : "Shadowsocks"),
 );
 
+const runtimeLabel = computed(() => {
+  const labels = {
+    stopped: "DIRECT 已停止",
+    starting: "DIRECT 启动中",
+    running: "DIRECT 运行中",
+    stopping: "DIRECT 停止中",
+    "recovery-required": "需要网络恢复",
+    failed: "DIRECT 失败",
+  };
+  return labels[app.runtime.state];
+});
+
 onMounted(async () => {
   await app.initializeConfig();
-  try {
-    runtime.value = await invoke<RuntimeSnapshot>("get_runtime_snapshot");
-  } catch {
-    runtime.value = {
-      platform: "browser-preview",
-      serviceState: "not-installed",
-      tunAvailable: false,
-      version: "0.1.0",
-    };
-  }
+  await app.initializeRuntime();
 });
 </script>
 
@@ -65,7 +65,7 @@ onMounted(async () => {
             class="status-dot"
             :class="{ 'status-dot--active': app.isConnected }"
           />
-          <span>{{ app.isConnected ? "网络已保护" : "等待连接" }}</span>
+          <span>{{ runtimeLabel }}</span>
         </div>
         <RouterLink :to="{ name: 'settings' }" class="nav-item">
           <AppIcon name="settings" />
@@ -81,9 +81,12 @@ onMounted(async () => {
           <h1>{{ currentLabel }}</h1>
         </div>
         <div class="topbar__actions">
-          <div class="engine-state" :title="runtime?.platform">
+          <div
+            class="engine-state"
+            :title="`${app.runtime.platform} · ${runtimeLabel}`"
+          >
             <span class="engine-state__pulse" />
-            <span>核心 {{ runtime?.version ?? "…" }}</span>
+            <span>核心 {{ app.runtime.version || "…" }}</span>
           </div>
         </div>
       </header>

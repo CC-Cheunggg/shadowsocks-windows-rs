@@ -1,5 +1,10 @@
-use super::model::{AppConfig, DEFAULT_CONFIG_FILE_NAME, ServerProfile, ValidationError};
-use std::fs::{self, File, OpenOptions};
+use super::model::{
+    AppConfig, CURRENT_CONFIG_VERSION, DEFAULT_CONFIG_FILE_NAME, LEGACY_CONFIG_VERSION,
+    ServerProfile, ValidationError,
+};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -12,6 +17,8 @@ pub enum ConfigError {
     Io(#[source] io::Error),
     #[error("configuration JSON could not be processed")]
     Json(#[source] serde_json::Error),
+    #[error("configuration version is not supported")]
+    UnsupportedVersion,
     #[error("{0}")]
     Validation(#[from] ValidationError),
     #[error("configuration state is unavailable")]
@@ -36,6 +43,7 @@ impl From<serde_json::Error> for ConfigError {
 pub struct LoadResult {
     pub config: AppConfig,
     pub recovered_backup: Option<PathBuf>,
+    pub migrated_backup: Option<PathBuf>,
 }
 
 pub struct ConfigStore {
@@ -49,6 +57,7 @@ impl ConfigStore {
         let LoadResult {
             config,
             recovered_backup: _recovered_backup,
+            migrated_backup: _migrated_backup,
         } = load_or_recover(&path)?;
         Ok(Self {
             path,
@@ -146,14 +155,27 @@ pub fn load_or_recover(path: &Path) -> Result<LoadResult, ConfigError> {
         return Ok(LoadResult {
             config,
             recovered_backup: None,
+            migrated_backup: None,
         });
     }
 
-    match load_config(path) {
-        Ok(config) => Ok(LoadResult {
+    let bytes = fs::read(path)?;
+    match decode_config(&bytes) {
+        Ok((config, None)) => Ok(LoadResult {
             config,
             recovered_backup: None,
+            migrated_backup: None,
         }),
+        Ok((config, Some(previous_version))) => {
+            let backup = backup_before_migration(path, &bytes, previous_version)?;
+            atomic_save(path, &config)?;
+            Ok(LoadResult {
+                config,
+                recovered_backup: None,
+                migrated_backup: Some(backup),
+            })
+        }
+        Err(ConfigError::UnsupportedVersion) => Err(ConfigError::UnsupportedVersion),
         Err(ConfigError::Json(_) | ConfigError::Validation(_)) => {
             let backup = backup_corrupt_config(path)?;
             let config = AppConfig::default();
@@ -161,16 +183,109 @@ pub fn load_or_recover(path: &Path) -> Result<LoadResult, ConfigError> {
             Ok(LoadResult {
                 config,
                 recovered_backup: Some(backup),
+                migrated_backup: None,
             })
         }
         Err(error) => Err(error),
     }
 }
 
+fn decode_config(bytes: &[u8]) -> Result<(AppConfig, Option<u32>), ConfigError> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(ConfigError::UnsupportedVersion)?;
+
+    let migrated_from = match version {
+        CURRENT_CONFIG_VERSION => None,
+        LEGACY_CONFIG_VERSION => {
+            migrate_v1_to_v2(&mut value)?;
+            Some(LEGACY_CONFIG_VERSION)
+        }
+        _ => return Err(ConfigError::UnsupportedVersion),
+    };
+
+    let config: AppConfig = serde_json::from_value(value)?;
+    config.validate()?;
+    Ok((config, migrated_from))
+}
+
+fn migrate_v1_to_v2(value: &mut serde_json::Value) -> Result<(), ConfigError> {
+    let object = value.as_object_mut().ok_or_else(|| {
+        ConfigError::Json(json_type_error("configuration root must be an object"))
+    })?;
+    object.insert(
+        "version".to_owned(),
+        serde_json::Value::from(CURRENT_CONFIG_VERSION),
+    );
+
+    // Version 1 exposed `tun.enabled` only as an inert placeholder. Version 2
+    // makes Wintun the sole traffic entry point, so migration explicitly turns
+    // it on. All credentials and server objects remain untouched.
+    match object.get_mut("tun") {
+        Some(serde_json::Value::Object(tun)) => {
+            tun.insert("enabled".to_owned(), serde_json::Value::Bool(true));
+        }
+        Some(_) => {
+            return Err(ConfigError::Json(json_type_error(
+                "TUN configuration must be an object",
+            )));
+        }
+        None => {
+            object.insert(
+                "tun".to_owned(),
+                serde_json::to_value(super::model::TunConfig::default())?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn json_type_error(message: &'static str) -> serde_json::Error {
+    <serde_json::Error as serde::de::Error>::custom(message)
+}
+
+fn backup_before_migration(
+    path: &Path,
+    bytes: &[u8],
+    previous_version: u32,
+) -> Result<PathBuf, ConfigError> {
+    let parent = path.parent().ok_or_else(|| {
+        ConfigError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration path has no parent directory",
+        ))
+    })?;
+    let stamp = timestamp_nanos();
+    for suffix in 0..1000_u16 {
+        let backup = parent.join(format!(
+            "config.pre-migration-v{previous_version}-{stamp}-{suffix}.json"
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                return Ok(backup);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ConfigError::Io(error)),
+        }
+    }
+    Err(ConfigError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to allocate a configuration migration backup name",
+    )))
+}
+
 pub fn load_config(path: &Path) -> Result<AppConfig, ConfigError> {
     let bytes = fs::read(path)?;
-    let config: AppConfig = serde_json::from_slice(&bytes)?;
-    config.validate()?;
+    let (config, _) = decode_config(&bytes)?;
     Ok(config)
 }
 
@@ -434,5 +549,61 @@ mod tests {
     fn serialized_config_contains_an_explicit_version() {
         let json = serde_json::to_value(AppConfig::default()).unwrap();
         assert_eq!(json["version"], CURRENT_CONFIG_VERSION);
+    }
+
+    #[test]
+    fn version_one_is_backed_up_and_migrated_without_losing_credentials() {
+        let directory = TestDirectory::new("migration");
+        let path = directory.config_path();
+        let mut legacy = serde_json::to_value(AppConfig {
+            servers: vec![valid_server()],
+            selected_server_id: Some("test-server".to_owned()),
+            ..AppConfig::default()
+        })
+        .unwrap();
+        legacy["version"] = serde_json::Value::from(LEGACY_CONFIG_VERSION);
+        legacy.as_object_mut().unwrap().remove("routing");
+        for key in [
+            "management_exclusions",
+            "tcp_session_timeout_seconds",
+            "udp_idle_timeout_seconds",
+        ] {
+            legacy["tun"].as_object_mut().unwrap().remove(key);
+        }
+        legacy["tun"]["enabled"] = serde_json::Value::Bool(false);
+        for key in [
+            "source",
+            "tcp_fallback",
+            "cache_capacity",
+            "cache_ttl_seconds",
+        ] {
+            legacy["dns"].as_object_mut().unwrap().remove(key);
+        }
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(&path, &legacy_bytes).unwrap();
+
+        let result = load_or_recover(&path).unwrap();
+        let backup = result.migrated_backup.expect("migration backup");
+        assert_eq!(fs::read(backup).unwrap(), legacy_bytes);
+        assert_eq!(result.config.version, CURRENT_CONFIG_VERSION);
+        assert!(result.config.tun.enabled);
+        assert_eq!(result.config.servers[0].password, valid_server().password);
+        assert_eq!(load_config(&path).unwrap(), result.config);
+    }
+
+    #[test]
+    fn unknown_future_version_is_not_replaced_with_defaults() {
+        let directory = TestDirectory::new("future-version");
+        let path = directory.config_path();
+        let mut future = serde_json::to_value(AppConfig::default()).unwrap();
+        future["version"] = serde_json::Value::from(CURRENT_CONFIG_VERSION + 1);
+        let bytes = serde_json::to_vec_pretty(&future).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            load_or_recover(&path),
+            Err(ConfigError::UnsupportedVersion)
+        ));
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 }

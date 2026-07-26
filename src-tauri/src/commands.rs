@@ -1,24 +1,29 @@
 use crate::config::{AppConfig, ConfigStore, ServerProfile};
-use serde::Serialize;
+use crate::runtime::{RuntimeManager, RuntimeSnapshot};
 use tauri::State;
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeSnapshot {
-    platform: &'static str,
-    service_state: &'static str,
-    tun_available: bool,
-    version: &'static str,
+#[tauri::command]
+pub fn get_runtime_snapshot(manager: State<'_, RuntimeManager>) -> RuntimeSnapshot {
+    manager.snapshot()
 }
 
 #[tauri::command]
-pub fn get_runtime_snapshot() -> RuntimeSnapshot {
-    RuntimeSnapshot {
-        platform: std::env::consts::OS,
-        service_state: "not-installed",
-        tun_available: cfg!(target_os = "windows"),
-        version: env!("CARGO_PKG_VERSION"),
-    }
+pub fn start_tunnel(
+    store: State<'_, ConfigStore>,
+    manager: State<'_, RuntimeManager>,
+) -> Result<RuntimeSnapshot, String> {
+    let config = store.get_config().map_err(|error| error.to_string())?;
+    manager.start(&config).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn stop_tunnel(manager: State<'_, RuntimeManager>) -> Result<RuntimeSnapshot, String> {
+    manager.stop().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn recover_network(manager: State<'_, RuntimeManager>) -> Result<RuntimeSnapshot, String> {
+    manager.recover().map_err(|error| error.to_string())
 }
 
 #[tauri::command]

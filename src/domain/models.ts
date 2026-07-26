@@ -5,6 +5,16 @@ export type ConnectionState =
   | "connected"
   | "disconnecting"
   | "error";
+export type RouteAction = "direct" | "proxy";
+export type RuleMatch = "domain_exact" | "domain_suffix" | "ip_cidr";
+export type DnsSource = "system" | "custom";
+export type RuntimeState =
+  | "stopped"
+  | "starting"
+  | "running"
+  | "stopping"
+  | "recovery-required"
+  | "failed";
 
 export interface ServerProfile {
   id: string;
@@ -22,8 +32,12 @@ export interface ServerProfile {
 
 export interface DnsConfig {
   enabled: boolean;
+  source: DnsSource;
   servers: string[];
   ipv6: boolean;
+  tcp_fallback: boolean;
+  cache_capacity: number;
+  cache_ttl_seconds: number;
 }
 
 export interface TunConfig {
@@ -31,6 +45,22 @@ export interface TunConfig {
   interface_name: string;
   mtu: number;
   ipv6: boolean;
+  management_exclusions: string[];
+  tcp_session_timeout_seconds: number;
+  udp_idle_timeout_seconds: number;
+}
+
+export interface RoutingRule {
+  id: string;
+  enabled: boolean;
+  match_type: RuleMatch;
+  value: string;
+  action: RouteAction;
+}
+
+export interface RoutingConfig {
+  rules: RoutingRule[];
+  default_action: RouteAction;
 }
 
 export interface KillSwitchConfig {
@@ -54,15 +84,35 @@ export interface AppConfig {
   servers: ServerProfile[];
   dns: DnsConfig;
   tun: TunConfig;
+  routing: RoutingConfig;
   kill_switch: KillSwitchConfig;
   subscriptions: SubscriptionSource[];
 }
 
+export interface RuntimeCounters {
+  tunRxPackets: number;
+  tunTxPackets: number;
+  capturedTcpSessions: number;
+  capturedUdpDatagrams: number;
+  routeDirect: number;
+  routeProxy: number;
+  systemProxyDetected: number;
+  routeDirectSystemProxy: number;
+  directTcpConnections: number;
+  directUdpAssociations: number;
+  unsupportedPackets: number;
+  droppedPackets: number;
+  loopPreventionDrops: number;
+}
+
 export interface RuntimeSnapshot {
   platform: string;
-  serviceState: string;
+  state: RuntimeState;
   tunAvailable: boolean;
   version: string;
+  counters: RuntimeCounters;
+  lastError: string | null;
+  recoveryRequired: boolean;
 }
 
 export interface TrafficSample {

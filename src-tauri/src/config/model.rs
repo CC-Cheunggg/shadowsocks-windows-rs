@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::net::IpAddr;
 
-pub const CURRENT_CONFIG_VERSION: u32 = 1;
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
+pub const LEGACY_CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "config.json";
 pub const SUPPORTED_METHODS: [&str; 3] = [
     "2022-blake3-chacha20-poly1305",
@@ -24,20 +26,84 @@ impl Default for ConnectionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteAction {
+    Direct,
+    #[default]
+    Proxy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleMatch {
+    DomainExact,
+    DomainSuffix,
+    IpCidr,
+}
+
+impl Default for RuleMatch {
+    fn default() -> Self {
+        Self::DomainSuffix
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RoutingRule {
+    pub id: String,
+    pub enabled: bool,
+    pub match_type: RuleMatch,
+    pub value: String,
+    pub action: RouteAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingConfig {
+    pub rules: Vec<RoutingRule>,
+    pub default_action: RouteAction,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            default_action: RouteAction::Proxy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsSource {
+    System,
+    #[default]
+    Custom,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DnsConfig {
     pub enabled: bool,
+    pub source: DnsSource,
     pub servers: Vec<String>,
     pub ipv6: bool,
+    pub tcp_fallback: bool,
+    pub cache_capacity: usize,
+    pub cache_ttl_seconds: u64,
 }
 
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            source: DnsSource::Custom,
             servers: vec!["1.1.1.1".to_owned(), "8.8.8.8".to_owned()],
             ipv6: true,
+            tcp_fallback: true,
+            cache_capacity: 4096,
+            cache_ttl_seconds: 300,
         }
     }
 }
@@ -49,15 +115,21 @@ pub struct TunConfig {
     pub interface_name: String,
     pub mtu: u16,
     pub ipv6: bool,
+    pub management_exclusions: Vec<String>,
+    pub tcp_session_timeout_seconds: u64,
+    pub udp_idle_timeout_seconds: u64,
 }
 
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             interface_name: "Shadowsocks".to_owned(),
             mtu: 1500,
             ipv6: true,
+            management_exclusions: Vec::new(),
+            tcp_session_timeout_seconds: 300,
+            udp_idle_timeout_seconds: 60,
         }
     }
 }
@@ -168,6 +240,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub tun: TunConfig,
     #[serde(default)]
+    pub routing: RoutingConfig,
+    #[serde(default)]
     pub kill_switch: KillSwitchConfig,
     #[serde(default)]
     pub subscriptions: Vec<SubscriptionSource>,
@@ -182,6 +256,7 @@ impl Default for AppConfig {
             servers: Vec::new(),
             dns: DnsConfig::default(),
             tun: TunConfig::default(),
+            routing: RoutingConfig::default(),
             kill_switch: KillSwitchConfig::default(),
             subscriptions: Vec::new(),
         }
@@ -220,22 +295,55 @@ impl AppConfig {
         if self.subscriptions.len() > 1_000 {
             return Err(ValidationError::new("too many subscription sources"));
         }
-        if !(576..=9000).contains(&self.tun.mtu) {
+        if !(1280..=9000).contains(&self.tun.mtu) {
             return Err(ValidationError::new("TUN MTU is outside the allowed range"));
         }
-        validate_short_text(
-            &self.tun.interface_name,
-            "TUN interface name is invalid",
-            false,
-        )?;
-
-        if self.dns.enabled && self.dns.servers.is_empty() {
+        validate_interface_name(&self.tun.interface_name)?;
+        if !(10..=86_400).contains(&self.tun.tcp_session_timeout_seconds) {
             return Err(ValidationError::new(
-                "at least one DNS server is required when DNS is enabled",
+                "TCP session timeout is outside the allowed range",
+            ));
+        }
+        if !(5..=3_600).contains(&self.tun.udp_idle_timeout_seconds) {
+            return Err(ValidationError::new(
+                "UDP idle timeout is outside the allowed range",
+            ));
+        }
+        if self.tun.management_exclusions.len() > 256 {
+            return Err(ValidationError::new("too many TUN management exclusions"));
+        }
+        for exclusion in &self.tun.management_exclusions {
+            validate_host_cidr(exclusion, "TUN management exclusion is invalid")?;
+        }
+
+        if self.dns.enabled && self.dns.source == DnsSource::Custom && self.dns.servers.is_empty() {
+            return Err(ValidationError::new(
+                "at least one DNS server is required for custom DNS",
             ));
         }
         for server in &self.dns.servers {
-            validate_short_text(server, "DNS server entry is invalid", false)?;
+            validate_dns_server(server)?;
+        }
+        if !(16..=65_536).contains(&self.dns.cache_capacity) {
+            return Err(ValidationError::new(
+                "DNS cache capacity is outside the allowed range",
+            ));
+        }
+        if !(1..=86_400).contains(&self.dns.cache_ttl_seconds) {
+            return Err(ValidationError::new(
+                "DNS cache TTL is outside the allowed range",
+            ));
+        }
+
+        if self.routing.rules.len() > 10_000 {
+            return Err(ValidationError::new("too many routing rules"));
+        }
+        let mut rule_ids = HashSet::with_capacity(self.routing.rules.len());
+        for rule in &self.routing.rules {
+            rule.validate()?;
+            if !rule_ids.insert(rule.id.as_str()) {
+                return Err(ValidationError::new("routing rule IDs must be unique"));
+            }
         }
 
         let mut server_ids = HashSet::with_capacity(self.servers.len());
@@ -260,6 +368,21 @@ impl AppConfig {
                 return Err(ValidationError::new(
                     "subscription source IDs must be unique",
                 ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RoutingRule {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_id(&self.id, "routing rule ID is invalid")?;
+        match self.match_type {
+            RuleMatch::DomainExact | RuleMatch::DomainSuffix => {
+                validate_domain_pattern(&self.value)?;
+            }
+            RuleMatch::IpCidr => {
+                validate_ip_cidr(&self.value, "routing rule CIDR is invalid")?;
             }
         }
         Ok(())
@@ -334,6 +457,91 @@ fn validate_host(host: &str) -> Result<(), ValidationError> {
         || host.contains('/')
     {
         return Err(ValidationError::new("server host is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_interface_name(value: &str) -> Result<(), ValidationError> {
+    if value.trim().is_empty()
+        || value.len() > 128
+        || value.chars().any(char::is_control)
+        || value
+            .chars()
+            .any(|character| matches!(character, '\\' | '/' | ':'))
+    {
+        return Err(ValidationError::new("TUN interface name is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_dns_server(value: &str) -> Result<(), ValidationError> {
+    let host = value
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(value);
+    if host.parse::<IpAddr>().is_err() {
+        return Err(ValidationError::new("DNS server entry is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_domain_pattern(value: &str) -> Result<(), ValidationError> {
+    let value = value.trim_end_matches('.').trim_start_matches('.');
+    if value.is_empty()
+        || value.len() > 253
+        || value.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(ValidationError::new(
+            "routing rule domain pattern is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ip_cidr(value: &str, message: &'static str) -> Result<(), ValidationError> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| ValidationError::new(message))?;
+    let address = address
+        .parse::<IpAddr>()
+        .map_err(|_| ValidationError::new(message))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| ValidationError::new(message))?;
+    let valid = match address {
+        IpAddr::V4(_) => prefix <= 32,
+        IpAddr::V6(_) => prefix <= 128,
+    };
+    if !valid {
+        return Err(ValidationError::new(message));
+    }
+    Ok(())
+}
+
+fn validate_host_cidr(value: &str, message: &'static str) -> Result<(), ValidationError> {
+    validate_ip_cidr(value, message)?;
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| ValidationError::new(message))?;
+    let address = address
+        .parse::<IpAddr>()
+        .map_err(|_| ValidationError::new(message))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| ValidationError::new(message))?;
+    if !matches!(
+        (address, prefix),
+        (IpAddr::V4(_), 32) | (IpAddr::V6(_), 128)
+    ) {
+        return Err(ValidationError::new(message));
     }
     Ok(())
 }
@@ -438,5 +646,57 @@ mod tests {
                 "encryption method is not supported"
             );
         }
+    }
+
+    #[test]
+    fn validates_ordered_routing_rules_and_management_exclusions() {
+        let config = AppConfig {
+            mode: ConnectionMode::Rule,
+            routing: RoutingConfig {
+                rules: vec![
+                    RoutingRule {
+                        id: "domain-direct".to_owned(),
+                        enabled: true,
+                        match_type: RuleMatch::DomainSuffix,
+                        value: ".example.com".to_owned(),
+                        action: RouteAction::Direct,
+                    },
+                    RoutingRule {
+                        id: "ipv6-proxy".to_owned(),
+                        enabled: true,
+                        match_type: RuleMatch::IpCidr,
+                        value: "2001:db8::/32".to_owned(),
+                        action: RouteAction::Proxy,
+                    },
+                ],
+                default_action: RouteAction::Proxy,
+            },
+            tun: TunConfig {
+                management_exclusions: vec!["203.0.113.10/32".to_owned()],
+                ..TunConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.validate().unwrap();
+
+        let mut invalid = config;
+        invalid.routing.rules[1].value = "2001:db8::/129".to_owned();
+        assert_eq!(
+            invalid.validate().unwrap_err().to_string(),
+            "routing rule CIDR is invalid"
+        );
+    }
+
+    #[test]
+    fn system_dns_does_not_require_custom_servers() {
+        let config = AppConfig {
+            dns: DnsConfig {
+                source: DnsSource::System,
+                servers: Vec::new(),
+                ..DnsConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.validate().unwrap();
     }
 }

@@ -1,6 +1,8 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/resources/wintun/amd64/wintun.dll
+src-tauri/resources/wintun/WINTUN-LICENSE.txt
 
 .DS_Store
 Thumbs.db

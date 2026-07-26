@@ -9,13 +9,42 @@ const app = useAppStore();
 
 const connectionTitle = computed(() => {
   const labels = {
-    disconnected: "点击开启保护",
-    connecting: "正在建立安全连接",
-    connected: "设备流量已受保护",
-    disconnecting: "正在安全断开",
-    error: "连接遇到问题",
+    disconnected: "启动 Wintun 数据通路",
+    connecting: "正在接管网络流量",
+    connected: "DIRECT runtime 正在运行",
+    disconnecting: "正在恢复网络状态",
+    error: "DIRECT runtime 需要处理",
   };
   return labels[app.connectionState];
+});
+
+const modeNotice = computed(() => {
+  if (app.mode === "direct") {
+    return "全部受支持会话先经 Wintun、session 和 router，再从物理网卡 DIRECT 出站。";
+  }
+  if (app.mode === "rule") {
+    return "DNS 与确认的内网系统代理端点先使用必要 DIRECT；其余流量按顺序规则选择，PROXY 严格失败。";
+  }
+  return "DNS 与确认的内网系统代理端点保留必要 DIRECT；全局模式的其余普通流量选择 PROXY 并严格失败。";
+});
+
+const activePath = computed(() => {
+  if (!app.isConnected) return "Wintun 尚未接管";
+  if (app.mode === "direct") return "Wintun → Router → DIRECT";
+  if (app.mode === "rule") return "Wintun → 有序规则";
+  return "Wintun → Router → PROXY（普通流量）";
+});
+
+const runtimeBadge = computed(() => {
+  const labels = {
+    stopped: "STOP",
+    starting: "START",
+    running: "RUN",
+    stopping: "STOP",
+    "recovery-required": "FIX",
+    failed: "ERR",
+  };
+  return labels[app.runtime.state];
 });
 
 function formatRate(bytes: number) {
@@ -42,7 +71,7 @@ function formatBytes(bytes: number) {
         </div>
         <span class="privacy-badge">
           <AppIcon name="shield" :size="17" />
-          TUN防护
+          Wintun 接管
         </span>
       </div>
 
@@ -74,29 +103,42 @@ function formatBytes(bytes: number) {
             <i />
             {{
               app.isConnected
-                ? "已连接 · 所有兼容流量均通过安全隧道"
-                : "未连接 · 当前使用系统默认网络"
+                ? activePath
+                : "未运行 · 不启用或修改 Windows 系统代理"
             }}
           </span>
-          <button class="server-picker" type="button">
+          <div class="server-picker">
             <span>
-              <small>当前服务器</small>
-              <strong>{{ app.selectedServer.name }}</strong>
+              <small>本轮出站能力</small>
+              <strong>{{
+                app.mode === "direct" ? "物理网卡 DIRECT" : "PROXY 尚未实现"
+              }}</strong>
             </span>
             <span class="server-picker__latency">
-              {{ app.selectedServer.id ? "未测试" : "—" }}
+              {{ app.mode === "direct" ? "可用" : "FAIL CLOSED" }}
             </span>
-            <AppIcon name="chevron" :size="17" />
-          </button>
+          </div>
         </div>
       </div>
+
+      <p
+        v-if="app.runtime.lastError"
+        class="runtime-error"
+        role="alert"
+      >
+        {{ app.runtime.lastError }}
+      </p>
+      <p v-else-if="app.previewMode" class="runtime-error runtime-preview">
+        浏览器预览：主开关只模拟界面状态，不会创建 Wintun、路由或网络 socket。
+      </p>
 
       <div class="connection-card__footer">
         <ModeSelector
           :model-value="app.mode"
+          :disabled="app.isConnected || app.isTransitioning"
           @update:model-value="app.setMode"
         />
-        <p>规则模式会根据 GeoSite、GeoIP和用户规则智能分流。</p>
+        <p>{{ modeNotice }}</p>
       </div>
     </article>
 
@@ -104,31 +146,37 @@ function formatBytes(bytes: number) {
       <div class="card-heading">
         <div>
           <span class="card-kicker">网络健康</span>
-          <h3>防泄漏状态</h3>
+          <h3>DIRECT runtime</h3>
         </div>
-        <span class="score-ring">96</span>
+        <span class="score-ring">{{ runtimeBadge }}</span>
       </div>
       <ul class="health-list">
         <li>
-          <span class="health-icon health-icon--good">
-            <AppIcon name="check" :size="15" />
+          <span
+            class="health-icon"
+            :class="{ 'health-icon--good': app.runtime.tunAvailable }"
+          >
+            <AppIcon v-if="app.runtime.tunAvailable" name="check" :size="15" />
+            <span v-else class="mini-dot" />
           </span>
-          <span><strong>IPv4路由</strong><small>接管配置就绪</small></span>
-          <em>正常</em>
+          <span><strong>Wintun</strong><small>仅 Windows x86_64 runtime</small></span>
+          <em :class="{ muted: !app.runtime.tunAvailable }">{{
+            app.runtime.tunAvailable ? "可用" : "不可用"
+          }}</em>
         </li>
         <li>
           <span class="health-icon health-icon--good">
             <AppIcon name="check" :size="15" />
           </span>
-          <span><strong>DNS保护</strong><small>本地解析器</small></span>
-          <em>正常</em>
+          <span><strong>捕获 / 注入</strong><small>Wintun packet ring 计数</small></span>
+          <em>{{ app.runtime.counters.tunRxPackets }} / {{ app.runtime.counters.tunTxPackets }}</em>
         </li>
         <li>
           <span class="health-icon">
             <span class="mini-dot" />
           </span>
-          <span><strong>IPv6</strong><small>等待 Windows服务</small></span>
-          <em class="muted">待配置</em>
+          <span><strong>路由决策</strong><small>DIRECT / PROXY</small></span>
+          <em>{{ app.runtime.counters.routeDirect }} / {{ app.runtime.counters.routeProxy }}</em>
         </li>
       </ul>
     </article>
@@ -137,7 +185,7 @@ function formatBytes(bytes: number) {
       <div class="card-heading">
         <div>
           <span class="card-kicker">实时活动</span>
-          <h3>网络吞吐</h3>
+          <h3>{{ app.previewMode ? "预览吞吐" : "安全计数" }}</h3>
         </div>
         <RouterLink :to="{ name: 'traffic' }" class="text-link">
           查看详情
@@ -147,18 +195,28 @@ function formatBytes(bytes: number) {
       <div class="traffic-metrics">
         <div>
           <i class="legend-dot legend-dot--download" />
-          <span>下载</span>
-          <strong>{{ formatRate(app.latestTraffic.download) }}</strong>
+          <span>{{ app.previewMode ? "下载" : "捕获 TCP" }}</span>
+          <strong>{{
+            app.previewMode
+              ? formatRate(app.latestTraffic.download)
+              : app.runtime.counters.capturedTcpSessions
+          }}</strong>
         </div>
         <div>
           <i class="legend-dot legend-dot--upload" />
-          <span>上传</span>
-          <strong>{{ formatRate(app.latestTraffic.upload) }}</strong>
+          <span>{{ app.previewMode ? "上传" : "捕获 UDP" }}</span>
+          <strong>{{
+            app.previewMode
+              ? formatRate(app.latestTraffic.upload)
+              : app.runtime.counters.capturedUdpDatagrams
+          }}</strong>
         </div>
         <div class="traffic-total">
-          <span>今日总计</span>
+          <span>{{ app.previewMode ? "今日总计" : "丢弃包" }}</span>
           <strong>{{
-            formatBytes(app.uploadTotal + app.downloadTotal)
+            app.previewMode
+              ? formatBytes(app.uploadTotal + app.downloadTotal)
+              : app.runtime.counters.droppedPackets
           }}</strong>
         </div>
       </div>
@@ -184,14 +242,14 @@ function formatBytes(bytes: number) {
           <span class="quick-icon quick-icon--purple">
             <AppIcon name="subscriptions" />
           </span>
-          <span><strong>更新订阅</strong><small>上次更新 2小时前</small></span>
+          <span><strong>订阅</strong><small>本轮不实现下载</small></span>
           <AppIcon name="chevron" :size="16" />
         </RouterLink>
         <RouterLink :to="{ name: 'rules' }">
           <span class="quick-icon quick-icon--green">
             <AppIcon name="rules" />
           </span>
-          <span><strong>路由规则</strong><small>规则集已是最新</small></span>
+          <span><strong>路由规则</strong><small>{{ app.config?.routing.rules.length ?? 0 }} 条有序规则</small></span>
           <AppIcon name="chevron" :size="16" />
         </RouterLink>
       </div>

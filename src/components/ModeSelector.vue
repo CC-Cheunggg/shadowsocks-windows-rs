@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { ConnectionMode } from "@/domain/models";
 
-defineProps<{ modelValue: ConnectionMode }>();
+defineProps<{ modelValue: ConnectionMode; disabled?: boolean }>();
 const emit = defineEmits<{ "update:modelValue": [value: ConnectionMode] }>();
 
 const modes: Array<{ id: ConnectionMode; label: string }> = [
@@ -18,6 +18,7 @@ const modes: Array<{ id: ConnectionMode; label: string }> = [
       :key="item.id"
       type="button"
       :class="{ active: modelValue === item.id }"
+      :disabled="disabled"
       @click="emit('update:modelValue', item.id)"
     >
       {{ item.label }}

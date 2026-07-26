@@ -5,6 +5,8 @@ import type {
   AppConfig,
   ConnectionMode,
   ConnectionState,
+  RuntimeSnapshot,
+  RuntimeState,
   ServerProfile,
   TrafficSample,
 } from "@/domain/models";
@@ -25,7 +27,7 @@ const EMPTY_SERVER: ServerProfile = {
 
 // Browser-only sample data. Tauri mode always replaces this with Rust-owned config.
 const BROWSER_PREVIEW_FALLBACK: AppConfig = {
-  version: 1,
+  version: 2,
   mode: "rule",
   selected_server_id: "preview-tokyo-edge",
   servers: [
@@ -56,16 +58,58 @@ const BROWSER_PREVIEW_FALLBACK: AppConfig = {
       source: "subscription",
     },
   ],
-  dns: { enabled: true, servers: ["1.1.1.1", "8.8.8.8"], ipv6: true },
+  dns: {
+    enabled: true,
+    source: "custom",
+    servers: ["1.1.1.1", "8.8.8.8"],
+    ipv6: true,
+    tcp_fallback: true,
+    cache_capacity: 4096,
+    cache_ttl_seconds: 300,
+  },
   tun: {
-    enabled: false,
+    enabled: true,
     interface_name: "Shadowsocks",
     mtu: 1500,
     ipv6: true,
+    management_exclusions: [],
+    tcp_session_timeout_seconds: 300,
+    udp_idle_timeout_seconds: 60,
   },
+  routing: { rules: [], default_action: "proxy" },
   kill_switch: { enabled: false, allow_lan: false },
   subscriptions: [],
 };
+
+const EMPTY_COUNTERS = {
+  tunRxPackets: 0,
+  tunTxPackets: 0,
+  capturedTcpSessions: 0,
+  capturedUdpDatagrams: 0,
+  routeDirect: 0,
+  routeProxy: 0,
+  systemProxyDetected: 0,
+  routeDirectSystemProxy: 0,
+  directTcpConnections: 0,
+  directUdpAssociations: 0,
+  unsupportedPackets: 0,
+  droppedPackets: 0,
+  loopPreventionDrops: 0,
+};
+
+function browserRuntimeSnapshot(
+  state: RuntimeState = "stopped",
+): RuntimeSnapshot {
+  return {
+    platform: "browser-preview",
+    state,
+    tunAvailable: false,
+    version: "0.1.0",
+    counters: { ...EMPTY_COUNTERS },
+    lastError: null,
+    recoveryRequired: false,
+  };
+}
 
 const initialTraffic: TrafficSample[] = Array.from({ length: 24 }, (_, index) => ({
   at: Date.now() - (23 - index) * 2_000,
@@ -83,26 +127,39 @@ function browserPreviewConfig(): AppConfig {
 }
 
 export const useAppStore = defineStore("app", () => {
-  const connectionState = ref<ConnectionState>("disconnected");
   const config = ref<AppConfig | null>(null);
   const configLoading = ref(true);
   const configError = ref<string | null>(null);
   const previewMode = ref(false);
-  const traffic = ref<TrafficSample[]>(initialTraffic);
-  const uploadTotal = ref(182 * 1024 * 1024);
-  const downloadTotal = ref(1.84 * 1024 * 1024 * 1024);
+  const runtime = ref<RuntimeSnapshot>(browserRuntimeSnapshot());
+  const runtimeLoading = ref(true);
+  const traffic = ref<TrafficSample[]>([]);
+  const uploadTotal = ref(0);
+  const downloadTotal = ref(0);
   let initialization: Promise<void> | null = null;
+  let runtimeInitialization: Promise<void> | null = null;
 
   const mode = computed(() => config.value?.mode ?? "rule");
   const servers = computed(() => config.value?.servers ?? []);
   const selectedServerId = computed(
     () => config.value?.selected_server_id ?? "",
   );
-  const isConnected = computed(() => connectionState.value === "connected");
+  const connectionState = computed<ConnectionState>(() => {
+    const states: Record<RuntimeState, ConnectionState> = {
+      stopped: "disconnected",
+      starting: "connecting",
+      running: "connected",
+      stopping: "disconnecting",
+      "recovery-required": "error",
+      failed: "error",
+    };
+    return states[runtime.value.state];
+  });
+  const isConnected = computed(() => runtime.value.state === "running");
   const isTransitioning = computed(
     () =>
-      connectionState.value === "connecting" ||
-      connectionState.value === "disconnecting",
+      runtime.value.state === "starting" ||
+      runtime.value.state === "stopping",
   );
   const selectedServer = computed(
     () =>
@@ -129,6 +186,9 @@ export const useAppStore = defineStore("app", () => {
       configLoading.value = true;
       if (!runningInTauri()) {
         previewMode.value = true;
+        traffic.value = initialTraffic;
+        uploadTotal.value = 182 * 1024 * 1024;
+        downloadTotal.value = 1.84 * 1024 * 1024 * 1024;
         applyConfig(browserPreviewConfig());
         configLoading.value = false;
         return;
@@ -144,13 +204,77 @@ export const useAppStore = defineStore("app", () => {
     return initialization;
   }
 
+  async function refreshRuntimeSnapshot() {
+    if (previewMode.value || !runningInTauri()) return;
+    try {
+      runtime.value = await invoke<RuntimeSnapshot>("get_runtime_snapshot");
+    } catch {
+      runtime.value = {
+        ...runtime.value,
+        state: "failed",
+        lastError: "无法读取本地 DIRECT runtime 状态。",
+      };
+    }
+  }
+
+  async function initializeRuntime() {
+    if (runtimeInitialization) return runtimeInitialization;
+    runtimeInitialization = (async () => {
+      runtimeLoading.value = true;
+      if (previewMode.value || !runningInTauri()) {
+        runtime.value = browserRuntimeSnapshot();
+        runtimeLoading.value = false;
+        return;
+      }
+      await refreshRuntimeSnapshot();
+      runtimeLoading.value = false;
+      window.setInterval(refreshRuntimeSnapshot, 1_500);
+    })();
+    return runtimeInitialization;
+  }
+
   async function toggleConnection() {
     if (isTransitioning.value) return;
 
-    connectionState.value = isConnected.value ? "disconnecting" : "connecting";
-    await new Promise((resolve) => window.setTimeout(resolve, 520));
-    connectionState.value =
-      connectionState.value === "connecting" ? "connected" : "disconnected";
+    if (previewMode.value) {
+      const stopping = isConnected.value;
+      runtime.value = browserRuntimeSnapshot(
+        stopping ? "stopping" : "starting",
+      );
+      await new Promise((resolve) => window.setTimeout(resolve, 320));
+      runtime.value = browserRuntimeSnapshot(stopping ? "stopped" : "running");
+      return;
+    }
+
+    if (runtime.value.recoveryRequired) {
+      runtime.value = {
+        ...runtime.value,
+        state: "recovery-required",
+        lastError: "检测到待恢复的网络状态；请先运行受限恢复命令。",
+      };
+      return;
+    }
+
+    const stopping = isConnected.value;
+    runtime.value = {
+      ...runtime.value,
+      state: stopping ? "stopping" : "starting",
+      lastError: null,
+    };
+    try {
+      runtime.value = await invoke<RuntimeSnapshot>(
+        stopping ? "stop_tunnel" : "start_tunnel",
+      );
+    } catch {
+      await refreshRuntimeSnapshot();
+      if (!runtime.value.lastError) {
+        runtime.value = {
+          ...runtime.value,
+          state: "failed",
+          lastError: "DIRECT runtime 操作未完成，且无法读取详细状态。",
+        };
+      }
+    }
   }
 
   async function selectServer(id: string) {
@@ -165,18 +289,28 @@ export const useAppStore = defineStore("app", () => {
     }
   }
 
-  async function setMode(nextMode: ConnectionMode) {
-    if (!config.value) return;
-    const next = { ...config.value, mode: nextMode };
+  async function saveCurrentConfig(next: AppConfig): Promise<boolean> {
+    if (isConnected.value || isTransitioning.value) {
+      configError.value = "请先停止 DIRECT runtime，再修改网络配置。";
+      return false;
+    }
     if (previewMode.value) {
       applyConfig(next);
-      return;
+      return true;
     }
     try {
       applyConfig(await invoke<AppConfig>("save_config", { config: next }));
+      return true;
     } catch {
       failConfigOperation();
+      return false;
     }
+  }
+
+  async function setMode(nextMode: ConnectionMode) {
+    if (!config.value) return;
+    const next = { ...config.value, mode: nextMode };
+    await saveCurrentConfig(next);
   }
 
   async function addServer(
@@ -244,6 +378,8 @@ export const useAppStore = defineStore("app", () => {
     configLoading,
     configError,
     previewMode,
+    runtime,
+    runtimeLoading,
     mode,
     servers,
     selectedServerId,
@@ -255,8 +391,11 @@ export const useAppStore = defineStore("app", () => {
     selectedServer,
     latestTraffic,
     initializeConfig,
+    initializeRuntime,
+    refreshRuntimeSnapshot,
     toggleConnection,
     selectServer,
+    saveCurrentConfig,
     setMode,
     addServer,
     updateServer,
