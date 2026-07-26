@@ -328,15 +328,17 @@ The Windows Actions workflow:
 5. checks formatting and compiles/tests all Rust targets for
    `x86_64-pc-windows-msvc`;
 6. builds the desktop app with `custom-protocol`, plus the recovery helper and
-   smoke executable, in release mode;
-7. creates a uniquely named temporary Wintun adapter;
-8. assigns only TEST-NET addresses and two isolated `/32` routes through the
+   smoke executable, in release mode with the MSVC CRT linked statically;
+7. rejects any packaged EXE or DLL that imports a dynamic MSVC/UCRT DLL, so
+   the acceptance machine does not need the Visual C++ x64 Redistributable;
+8. creates a uniquely named temporary Wintun adapter;
+9. assigns only TEST-NET addresses and two isolated `/32` routes through the
    native IP Helper/NetIO layer;
-9. verifies UDP capture/response injection and a TCP SYN/SYN-ACK/ACK exchange;
-10. always runs route/address cleanup and residual-adapter verification; normal
+10. verifies UDP capture/response injection and a TCP SYN/SYN-ACK/ACK exchange;
+11. always runs route/address cleanup and residual-adapter verification; normal
    Rust error unwinding also releases the session/owned adapter;
-11. verifies the hosted runner's default-route fingerprint is unchanged; and
-12. stages and uploads uniquely named acceptance media with `BUILD-INFO` and
+12. verifies the hosted runner's default-route fingerprint is unchanged; and
+13. stages and uploads uniquely named acceptance media with `BUILD-INFO` and
     `SHA256SUMS`.
 
 The isolated Actions smoke test intentionally does not install full-capture
@@ -350,6 +352,10 @@ an arbitrary residual adapter.
 The uploaded directory contains the desktop executable,
 `network_recover.exe`, `wintun_smoke.exe`, application-local `wintun.dll`,
 `WINTUN-LICENSE.txt`, `WINDOWS_RECOVERY.md`, `BUILD-INFO`, and `SHA256SUMS`.
+The three Rust executables statically link the MSVC CRT and therefore do not
+require a separate Visual C++ x64 Redistributable installation. Windows system
+components and the separately verified application-local Wintun DLL remain
+normal platform/runtime dependencies.
 The workflow definition is not evidence that a run passed: Windows test media
 must be taken only from a completed successful Actions run, and its
 `SHA256SUMS` must be verified before upload to an acceptance VM. Do not copy an

@@ -146,6 +146,17 @@ jobs:
             throw "Application-local Wintun DLL hash mismatch."
           }
 
+      - name: Verify packaged PE modules do not import a dynamic Microsoft CRT
+        shell: pwsh
+        run: |
+          $release = "src-tauri/target/x86_64-pc-windows-msvc/release"
+          ./scripts/verify-static-msvc-crt.ps1 -Binary @(
+            "$release/shadowsocks-windows-rs.exe",
+            "$release/network_recover.exe",
+            "$release/wintun_smoke.exe",
+            "$release/wintun.dll"
+          )
+
       - name: Capture hosted-runner default-route baseline
         shell: pwsh
         run: |
@@ -264,6 +275,7 @@ jobs:
             "target=x86_64-pc-windows-msvc",
             "profile=release",
             "features=custom-protocol",
+            "msvc_crt=static",
             "rustc=$(rustc --version)",
             "cargo=$(cargo --version)",
             "node=$(node --version)",
