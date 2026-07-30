@@ -12,6 +12,42 @@ pub const MIN_RING_CAPACITY: u32 = 0x2_0000;
 pub const MAX_RING_CAPACITY: u32 = 0x400_0000;
 pub const MAX_IP_PACKET_SIZE: usize = 0xffff;
 
+/// ABI-compatible Windows GUID supplied to `WintunCreateAdapter`.
+///
+/// Recovery records its canonical string before adapter creation, closing the
+/// otherwise unrecoverable gap between native creation and interface lookup.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterGuid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+impl AdapterGuid {
+    pub fn generate() -> Result<Self, WintunError> {
+        platform::generate_adapter_guid()
+    }
+
+    pub fn canonical_string(self) -> String {
+        format!(
+            "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            self.data1,
+            self.data2,
+            self.data3,
+            self.data4[0],
+            self.data4[1],
+            self.data4[2],
+            self.data4[3],
+            self.data4[4],
+            self.data4[5],
+            self.data4[6],
+            self.data4[7]
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterOwnership {
     Created,
@@ -82,8 +118,8 @@ fn validate_adapter_name(name: &str) -> Result<(), WintunError> {
 #[cfg(windows)]
 mod platform {
     use super::{
-        AdapterOwnership, MAX_IP_PACKET_SIZE, WINTUN_DLL_NAME, WintunError, validate_adapter_name,
-        validate_ring_capacity,
+        AdapterGuid, AdapterOwnership, MAX_IP_PACKET_SIZE, WINTUN_DLL_NAME, WintunError,
+        validate_adapter_name, validate_ring_capacity,
     };
     use std::ffi::{c_char, c_void};
     use std::ops::Deref;
@@ -122,6 +158,11 @@ mod platform {
         fn GetProcAddress(module: ModuleHandle, name: *const c_char) -> *mut c_void;
         fn GetLastError() -> u32;
         fn WaitForSingleObject(handle: EventHandle, milliseconds: u32) -> u32;
+    }
+
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoCreateGuid(guid: *mut AdapterGuid) -> i32;
     }
 
     #[link(name = "iphlpapi")]
@@ -238,20 +279,40 @@ mod platform {
             self.create_adapter_with_type(name, "Shadowsocks")
         }
 
+        pub fn create_adapter_with_guid(
+            &self,
+            name: &str,
+            guid: &AdapterGuid,
+        ) -> Result<Adapter, WintunError> {
+            self.create_adapter_with_type_and_guid(name, "Shadowsocks", Some(guid))
+        }
+
         pub fn create_adapter_with_type(
             &self,
             name: &str,
             tunnel_type: &str,
+        ) -> Result<Adapter, WintunError> {
+            self.create_adapter_with_type_and_guid(name, tunnel_type, None)
+        }
+
+        fn create_adapter_with_type_and_guid(
+            &self,
+            name: &str,
+            tunnel_type: &str,
+            guid: Option<&AdapterGuid>,
         ) -> Result<Adapter, WintunError> {
             validate_adapter_name(name)?;
             validate_adapter_name(tunnel_type)?;
             let name = wide(name);
             let tunnel_type = wide(tunnel_type);
             // SAFETY: strings are NUL terminated and pointers remain valid for
-            // the duration of the call. A random adapter GUID is requested.
-            let handle = unsafe {
-                (self.api.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), ptr::null())
-            };
+            // the duration of the call. The optional GUID has the Windows GUID
+            // ABI and remains alive for the call.
+            let guid = guid.map_or(ptr::null(), |guid| {
+                std::ptr::from_ref(guid).cast::<c_void>()
+            });
+            let handle =
+                unsafe { (self.api.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), guid) };
             let handle = NonNull::new(handle).ok_or_else(|| WintunError::Operation {
                 operation: "adapter creation",
                 // SAFETY: GetLastError has no preconditions.
@@ -279,6 +340,25 @@ mod platform {
                 handle,
                 AdapterOwnership::Opened,
             ))
+        }
+    }
+
+    pub(super) fn generate_adapter_guid() -> Result<AdapterGuid, WintunError> {
+        let mut guid = AdapterGuid {
+            data1: 0,
+            data2: 0,
+            data3: 0,
+            data4: [0; 8],
+        };
+        // SAFETY: `guid` is writable and ABI-compatible with Windows GUID.
+        let status = unsafe { CoCreateGuid(&mut guid) };
+        if status >= 0 {
+            Ok(guid)
+        } else {
+            Err(WintunError::Operation {
+                operation: "adapter GUID generation",
+                code: status as u32,
+            })
         }
     }
 
@@ -525,7 +605,9 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use super::{AdapterOwnership, WintunError, validate_adapter_name, validate_ring_capacity};
+    use super::{
+        AdapterGuid, AdapterOwnership, WintunError, validate_adapter_name, validate_ring_capacity,
+    };
     use std::ops::Deref;
     use std::time::Duration;
 
@@ -538,6 +620,15 @@ mod platform {
         }
 
         pub fn create_adapter(&self, name: &str) -> Result<Adapter, WintunError> {
+            validate_adapter_name(name)?;
+            Err(WintunError::UnsupportedPlatform)
+        }
+
+        pub fn create_adapter_with_guid(
+            &self,
+            name: &str,
+            _guid: &AdapterGuid,
+        ) -> Result<Adapter, WintunError> {
             validate_adapter_name(name)?;
             Err(WintunError::UnsupportedPlatform)
         }
@@ -556,6 +647,10 @@ mod platform {
             validate_adapter_name(name)?;
             Err(WintunError::UnsupportedPlatform)
         }
+    }
+
+    pub(super) fn generate_adapter_guid() -> Result<AdapterGuid, WintunError> {
+        Err(WintunError::UnsupportedPlatform)
     }
 
     #[derive(Clone)]
@@ -666,6 +761,21 @@ mod tests {
                 .chars()
                 .any(|character| matches!(character, '/' | '\\'))
         );
+    }
+
+    #[test]
+    fn adapter_guid_uses_the_canonical_windows_string_form() {
+        let guid = AdapterGuid {
+            data1: 0x1234_5678,
+            data2: 0x9abc,
+            data3: 0xdef0,
+            data4: [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
+        };
+        assert_eq!(
+            guid.canonical_string(),
+            "12345678-9abc-def0-1234-56789abcdef0"
+        );
+        assert_eq!(std::mem::size_of::<AdapterGuid>(), 16);
     }
 
     #[test]

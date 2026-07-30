@@ -18,7 +18,7 @@ const MAX_SNAPSHOT_SECTION_BYTES: usize = 4 * 1024 * 1024;
 const CAPTURE_V4_PREFIXES: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
 const CAPTURE_V6_PREFIXES: [&str; 2] = ["::/1", "8000::/1"];
 const MAX_SHADOW_CAPTURE_ROUTES: usize = 8_192;
-const MAX_RECOVERY_ROUTES: usize = 4 + MAX_SHADOW_CAPTURE_ROUTES + 64;
+const MAX_RECOVERY_ROUTES: usize = 4 + MAX_SHADOW_CAPTURE_ROUTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
@@ -172,6 +172,39 @@ pub struct MandatoryExclusion {
     pub reason: ExclusionReason,
 }
 
+impl MandatoryExclusion {
+    fn validate(&self, tun_interface: Option<&InterfaceIdentity>) -> Result<(), RouteError> {
+        self.physical_interface.validate()?;
+        if self.destination.is_ipv4() != self.physical_gateway.is_ipv4() {
+            return Err(RouteError::InvalidPlan(
+                "exclusion destination and gateway families differ",
+            ));
+        }
+        if self.destination.is_unspecified()
+            || self.destination.is_multicast()
+            || self.destination.is_loopback()
+            || self.physical_gateway.is_multicast()
+        {
+            return Err(RouteError::InvalidPlan(
+                "mandatory exclusion is not a physical unicast route",
+            ));
+        }
+        if tun_interface.is_some_and(|tun| self.physical_interface == *tun) {
+            return Err(RouteError::InvalidPlan(
+                "exclusion points back to the TUN interface",
+            ));
+        }
+        Ok(())
+    }
+
+    fn host_prefix(&self) -> String {
+        match self.destination {
+            IpAddr::V4(address) => format!("{address}/32"),
+            IpAddr::V6(address) => format!("{address}/128"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutePlan {
     pub tun_interface: InterfaceIdentity,
@@ -241,16 +274,17 @@ impl RoutePlan {
         if self.exclusions.len() > 64 {
             return Err(RouteError::InvalidPlan("too many mandatory exclusions"));
         }
+        let mut exclusion_destinations = HashSet::with_capacity(self.exclusions.len());
         for exclusion in &self.exclusions {
-            exclusion.physical_interface.validate()?;
-            if exclusion.destination.is_ipv4() != exclusion.physical_gateway.is_ipv4() {
+            exclusion.validate(Some(&self.tun_interface))?;
+            if !exclusion_destinations.insert(exclusion.destination) {
                 return Err(RouteError::InvalidPlan(
-                    "exclusion destination and gateway families differ",
+                    "mandatory exclusion destinations must be unique",
                 ));
             }
-            if exclusion.physical_interface == self.tun_interface {
+            if shadow_prefixes.contains(exclusion.host_prefix().as_str()) {
                 return Err(RouteError::InvalidPlan(
-                    "exclusion points back to the TUN interface",
+                    "mandatory exclusion overlaps a shadow capture route",
                 ));
             }
         }
@@ -489,13 +523,16 @@ impl RecoveryPlan {
         let mut routes = HashSet::new();
         for route in &self.routes {
             route.interface.validate()?;
+            if !self.adapter_owns_route(route) {
+                return Err(RouteError::InvalidPlan(
+                    "recovery journal contains an external-interface route",
+                ));
+            }
             let (network, prefix_length) = parse_network_prefix(&route.destination_prefix)?;
             if format_network_prefix(network, prefix_length) != route.destination_prefix
                 || route.next_hop.is_ipv4() != network.is_ipv4()
                 || route.metric == 0
                 || route.metric > 9_999
-                || (route.interface != self.tun_interface
-                    && prefix_length != if network.is_ipv4() { 32 } else { 128 })
             {
                 return Err(RouteError::InvalidPlan("recovery journal route is invalid"));
             }
@@ -575,40 +612,43 @@ impl RecoveryPlan {
     }
 
     pub(crate) fn is_valid_successor_of(&self, previous: &Self) -> bool {
-        self.tun_interface == previous.tun_interface
-            && self
-                .interface_addresses
-                .starts_with(&previous.interface_addresses)
-            && self.routes.starts_with(&previous.routes)
-            && self
-                .interface_settings
-                .starts_with(&previous.interface_settings)
-            && previous
-                .interface_addresses
-                .iter()
-                .enumerate()
-                .all(|(index, _)| {
-                    !matches!(
-                        (previous.address_state(index), self.address_state(index)),
-                        (OwnershipState::Applied, OwnershipState::Prepared)
-                    )
-                })
-            && previous.routes.iter().enumerate().all(|(index, _)| {
-                !matches!(
-                    (previous.route_state(index), self.route_state(index)),
-                    (OwnershipState::Applied, OwnershipState::Prepared)
-                )
-            })
-            && previous
-                .interface_settings
-                .iter()
-                .enumerate()
-                .all(|(index, _)| {
-                    !matches!(
-                        (previous.setting_state(index), self.setting_state(index)),
-                        (OwnershipState::Applied, OwnershipState::Prepared)
-                    )
-                })
+        if self.tun_interface != previous.tun_interface
+            || self.validate_journal_encoding(false).is_err()
+            || previous.validate_journal_encoding(false).is_err()
+        {
+            return false;
+        }
+
+        let Some(address_changes) = valid_resource_state_successor(
+            &previous.interface_addresses,
+            &previous.interface_address_states,
+            &self.interface_addresses,
+            &self.interface_address_states,
+        ) else {
+            return false;
+        };
+        let Some(route_changes) = valid_resource_state_successor(
+            &previous.routes,
+            &previous.route_states,
+            &self.routes,
+            &self.route_states,
+        ) else {
+            return false;
+        };
+        let Some(setting_changes) = valid_resource_state_successor(
+            &previous.interface_settings,
+            &previous.interface_setting_states,
+            &self.interface_settings,
+            &self.interface_setting_states,
+        ) else {
+            return false;
+        };
+
+        // A durable update is either an idempotent rewrite, one new Prepared
+        // resource, or one Prepared -> Applied transition. It may not append
+        // an already-Applied resource, batch multiple ownership claims, or
+        // combine an append with an Applied transition.
+        address_changes + route_changes + setting_changes <= 1
     }
 
     /// Removes only the exact address/route objects recorded in this plan.
@@ -616,12 +656,28 @@ impl RecoveryPlan {
     /// after startup are preserved.
     pub fn restore_owned(&self) -> Result<(), RouteError> {
         self.validate_journal_state()?;
-        rollback(self, RouteRestoreScope::All)
+        restore_interface_state_after_routes(
+            || rollback(self, RouteRestoreScope::RoutesOnly),
+            || rollback(self, RouteRestoreScope::InterfaceStateOnly),
+        )
     }
 
     pub(crate) fn restore_adapter_owned_only(&self) -> Result<(), RouteError> {
         self.validate_journal_state()?;
-        rollback(self, RouteRestoreScope::AdapterOnly)
+        restore_interface_state_after_routes(
+            || rollback(self, RouteRestoreScope::AdapterRoutesOnly),
+            || rollback(self, RouteRestoreScope::InterfaceStateOnly),
+        )
+    }
+
+    fn withdraw_owned_routes(&self) -> Result<(), RouteError> {
+        self.validate_journal_state()?;
+        rollback(self, RouteRestoreScope::RoutesOnly)
+    }
+
+    fn restore_interface_state(&self) -> Result<(), RouteError> {
+        self.validate_journal_state()?;
+        rollback(self, RouteRestoreScope::InterfaceStateOnly)
     }
 }
 
@@ -822,6 +878,16 @@ pub fn find_interface_by_luid(
     platform::find_interface_by_luid(interface_luid)
 }
 
+pub fn find_interface_by_guid(
+    interface_guid: &str,
+) -> Result<Option<InterfaceIdentity>, RouteError> {
+    platform::find_interface_by_guid(interface_guid)
+}
+
+pub(crate) fn interface_identities() -> Result<Vec<InterfaceIdentity>, RouteError> {
+    platform::interface_identities()
+}
+
 pub fn restore_isolated(
     interface: &InterfaceIdentity,
     addresses: &[InterfaceAddress],
@@ -848,7 +914,7 @@ pub fn restore_isolated(
         route_states: vec![OwnershipState::Applied; routes.len()],
         interface_setting_states: Vec::new(),
     };
-    rollback(&recovery, RouteRestoreScope::All)
+    recovery.restore_owned()
 }
 
 pub fn discover_primary_physical_interface(
@@ -870,6 +936,29 @@ pub fn discover_route_on_interface(
 ) -> Result<RouteBinding, RouteError> {
     expected_interface.validate()?;
     platform::discover_route_on_interface(destination, expected_interface)
+}
+
+/// Freshly verifies operator-owned host-route exclusions without claiming or
+/// mutating them. Each destination must have exactly one ActiveStore `/32` or
+/// `/128` row with the expected physical generation and gateway, and that row
+/// must still win the unconstrained best-route lookup.
+pub fn verify_mandatory_exclusions(exclusions: &[MandatoryExclusion]) -> Result<(), RouteError> {
+    if exclusions.len() > 64 {
+        return Err(RouteError::InvalidPlan("too many mandatory exclusions"));
+    }
+    let mut destinations = HashSet::with_capacity(exclusions.len());
+    for exclusion in exclusions {
+        exclusion.validate(None)?;
+        if !destinations.insert(exclusion.destination) {
+            return Err(RouteError::InvalidPlan(
+                "mandatory exclusion destinations must be unique",
+            ));
+        }
+    }
+    if exclusions.is_empty() {
+        return Ok(());
+    }
+    platform::verify_mandatory_exclusions(exclusions)
 }
 
 fn validate_discovered_binding(
@@ -896,24 +985,103 @@ fn validate_discovered_binding(
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedHostRoute {
+    interface_index: u32,
+    interface_luid: u64,
+    next_hop: IpAddr,
+    metric: u32,
+}
+
+#[cfg(any(windows, test))]
+fn validate_mandatory_host_route_candidates(
+    exclusion: &MandatoryExclusion,
+    candidates: &[ObservedHostRoute],
+) -> Result<(), RouteError> {
+    let [candidate] = candidates else {
+        return Err(RouteError::OwnershipMismatch(
+            "mandatory exclusion host route",
+        ));
+    };
+    if candidate.interface_index != exclusion.physical_interface.interface_index
+        || candidate.interface_luid != exclusion.physical_interface.interface_luid
+        || candidate.next_hop != exclusion.physical_gateway
+    {
+        return Err(RouteError::OwnershipMismatch(
+            "mandatory exclusion host route",
+        ));
+    }
+    // The route metric is deliberately not constrained. Exact host-prefix
+    // specificity, interface generation, gateway, and winning selection are
+    // the safety properties.
+    let _metric_may_vary = candidate.metric;
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn validate_mandatory_host_route_state(
+    exclusion: &MandatoryExclusion,
+    candidates: &[ObservedHostRoute],
+    best: &RouteBinding,
+    best_prefix: &str,
+) -> Result<(), RouteError> {
+    validate_mandatory_host_route_candidates(exclusion, candidates)?;
+    if best.interface != exclusion.physical_interface
+        || best.next_hop != exclusion.physical_gateway
+        || best_prefix != exclusion.host_prefix()
+    {
+        return Err(RouteError::OwnershipMismatch(
+            "mandatory exclusion best route",
+        ));
+    }
+    Ok(())
+}
+
 /// Owns only routes installed by this process. Drop is a best-effort safety
-/// net; normal shutdown should call `restore` so rollback errors are visible.
+/// net; normal shutdown must run the explicit ordered cleanup phases so
+/// rollback errors are visible and interface state is never restored early.
 pub struct RouteTransaction {
     original: SystemNetworkSnapshot,
     recovery: RecoveryPlan,
+    capture_routes_withdrawn: bool,
+    interface_state_restored: bool,
     restored: bool,
 }
 
-impl RouteTransaction {
-    pub fn install(plan: &RoutePlan) -> Result<Self, RouteError> {
-        Self::install_recording(plan, |_| Ok(()))
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteTransactionDropAction {
+    WithdrawRoutes,
+    PreserveJournalOnly,
+}
 
+fn route_transaction_drop_action(
+    restored: bool,
+    capture_routes_withdrawn: bool,
+) -> RouteTransactionDropAction {
+    if !restored && !capture_routes_withdrawn {
+        RouteTransactionDropAction::WithdrawRoutes
+    } else {
+        RouteTransactionDropAction::PreserveJournalOnly
+    }
+}
+
+impl RouteTransaction {
     pub fn install_recording(
         plan: &RoutePlan,
+        interrupted: &mut Option<Self>,
         mut record: impl FnMut(&RecoveryPlan) -> Result<(), RouteError>,
     ) -> Result<Self, RouteError> {
+        if interrupted.is_some() {
+            return Err(RouteError::InvalidPlan(
+                "route transaction handoff slot is occupied",
+            ));
+        }
         plan.validate()?;
+        // This is a read-only gate. A missing, ambiguous, stale, or non-winning
+        // operator-owned host route fails before any application-owned network
+        // object is changed.
+        verify_mandatory_exclusions(&plan.exclusions)?;
         let original = SystemNetworkSnapshot::capture()?;
         platform::verify_interface(&plan.tun_interface)?;
         let mut planned = plan.recovery_plan()?;
@@ -922,12 +1090,8 @@ impl RouteTransaction {
         }
         let mut routes_to_create = Vec::with_capacity(planned.routes.len());
         for route in std::mem::take(&mut planned.routes) {
+            ensure_adapter_owned_route(&plan.tun_interface, &route)?;
             platform::verify_interface(&route.interface)?;
-            // An exact physical exclusion that predates startup is already
-            // sufficient and must never be claimed or later deleted.
-            if route.interface != plan.tun_interface && original.contains_owned_route(&route)? {
-                continue;
-            }
             platform::ensure_route_absent(&route)?;
             routes_to_create.push(route);
         }
@@ -943,6 +1107,7 @@ impl RouteTransaction {
             route_states: Vec::new(),
             interface_setting_states: Vec::new(),
         };
+        let mut mutation_preconditions_verified = false;
 
         for family in [IpFamily::V4, IpFamily::V6] {
             if (family == IpFamily::V4 && !plan.enable_ipv4)
@@ -959,21 +1124,30 @@ impl RouteTransaction {
                 Ok(Some(setting)) => {
                     let index = recovery.push_prepared_setting(setting.clone());
                     if record(&recovery).is_err() {
-                        return Err(fail_after_rollback(
+                        return Err(handoff_failed_installation(
+                            interrupted,
+                            &original,
                             &recovery,
                             RouteError::JournalUpdateFailed,
                         ));
                     }
-                    if let Err(error) =
-                        platform::apply_interface_configuration(&plan.tun_interface, &setting)
-                    {
-                        return Err(fail_after_rollback(&recovery, error));
-                    }
+                    // Keep the native operation inside the gate so a failed
+                    // fresh verification cannot fall through to mutation.
+                    mutate_after_first_mandatory_verification(
+                        &plan.exclusions,
+                        &mut mutation_preconditions_verified,
+                        || platform::apply_interface_configuration(&plan.tun_interface, &setting),
+                    )
+                    .map_err(|error| {
+                        handoff_failed_installation(interrupted, &original, &recovery, error)
+                    })?;
                     // From this point the in-memory state is authoritative even
                     // if the Applied journal transition itself fails.
                     recovery.mark_setting_applied(index);
                     if record(&recovery).is_err() {
-                        return Err(fail_after_rollback(
+                        return Err(handoff_failed_installation(
+                            interrupted,
+                            &original,
                             &recovery,
                             RouteError::JournalUpdateFailed,
                         ));
@@ -981,7 +1155,12 @@ impl RouteTransaction {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    return Err(fail_after_rollback(&recovery, error));
+                    return Err(handoff_failed_installation(
+                        interrupted,
+                        &original,
+                        &recovery,
+                        error,
+                    ));
                 }
             }
         }
@@ -989,40 +1168,68 @@ impl RouteTransaction {
         for address in planned.interface_addresses() {
             let index = recovery.push_prepared_address(address.clone());
             if record(&recovery).is_err() {
-                return Err(fail_after_rollback(
+                return Err(handoff_failed_installation(
+                    interrupted,
+                    &original,
                     &recovery,
                     RouteError::JournalUpdateFailed,
                 ));
             }
-            if let Err(error) = platform::create_interface_address(&plan.tun_interface, address) {
-                return Err(fail_after_rollback(&recovery, error));
-            }
+            mutate_after_first_mandatory_verification(
+                &plan.exclusions,
+                &mut mutation_preconditions_verified,
+                || platform::create_interface_address(&plan.tun_interface, address),
+            )
+            .map_err(|error| {
+                handoff_failed_installation(interrupted, &original, &recovery, error)
+            })?;
             recovery.mark_address_applied(index);
             if record(&recovery).is_err() {
-                return Err(fail_after_rollback(
+                return Err(handoff_failed_installation(
+                    interrupted,
+                    &original,
                     &recovery,
                     RouteError::JournalUpdateFailed,
                 ));
             }
             if let Err(error) = platform::wait_interface_address_ready(&plan.tun_interface, address)
             {
-                return Err(fail_after_rollback(&recovery, error));
+                return Err(handoff_failed_installation(
+                    interrupted,
+                    &original,
+                    &recovery,
+                    error,
+                ));
             }
         }
+        let mut capture_preconditions_verified = false;
         for route in planned.owned_routes() {
             let index = recovery.push_prepared_route(route.clone());
             if record(&recovery).is_err() {
-                return Err(fail_after_rollback(
+                return Err(handoff_failed_installation(
+                    interrupted,
+                    &original,
                     &recovery,
                     RouteError::JournalUpdateFailed,
                 ));
             }
-            if let Err(error) = platform::add_route(route) {
-                return Err(fail_after_rollback(&recovery, error));
-            }
+            // Address/interface preparation can take seconds (including DAD).
+            // Re-run the complete read-only gate after the Prepared journal
+            // commit and immediately before the first capture route reaches
+            // the native create layer.
+            mutate_after_first_mandatory_verification(
+                &plan.exclusions,
+                &mut capture_preconditions_verified,
+                || add_adapter_owned_route(&plan.tun_interface, route),
+            )
+            .map_err(|error| {
+                handoff_failed_installation(interrupted, &original, &recovery, error)
+            })?;
             recovery.mark_route_applied(index);
             if record(&recovery).is_err() {
-                return Err(fail_after_rollback(
+                return Err(handoff_failed_installation(
+                    interrupted,
+                    &original,
                     &recovery,
                     RouteError::JournalUpdateFailed,
                 ));
@@ -1032,6 +1239,8 @@ impl RouteTransaction {
         Ok(Self {
             original,
             recovery,
+            capture_routes_withdrawn: false,
+            interface_state_restored: false,
             restored: false,
         })
     }
@@ -1040,7 +1249,13 @@ impl RouteTransaction {
         interface: InterfaceIdentity,
         addresses: Vec<InterfaceAddress>,
         routes: Vec<OwnedRoute>,
+        interrupted: &mut Option<Self>,
     ) -> Result<Self, RouteError> {
+        if interrupted.is_some() {
+            return Err(RouteError::InvalidPlan(
+                "route transaction handoff slot is occupied",
+            ));
+        }
         interface.validate()?;
         if routes.iter().any(|route| {
             parse_network_prefix(&route.destination_prefix)
@@ -1073,25 +1288,42 @@ impl RouteTransaction {
             interface_setting_states: Vec::new(),
         };
         for address in &addresses {
-            if let Err(error) = platform::create_interface_address(&interface, address) {
-                return Err(fail_after_rollback(&recovery, error));
-            }
             let index = recovery.push_prepared_address(address.clone());
+            if let Err(error) = platform::create_interface_address(&interface, address) {
+                return Err(handoff_failed_installation(
+                    interrupted,
+                    &original,
+                    &recovery,
+                    error,
+                ));
+            }
             recovery.mark_address_applied(index);
             if let Err(error) = platform::wait_interface_address_ready(&interface, address) {
-                return Err(fail_after_rollback(&recovery, error));
+                return Err(handoff_failed_installation(
+                    interrupted,
+                    &original,
+                    &recovery,
+                    error,
+                ));
             }
         }
         for route in &routes {
-            if let Err(error) = platform::add_route(route) {
-                return Err(fail_after_rollback(&recovery, error));
-            }
             let index = recovery.push_prepared_route(route.clone());
+            if let Err(error) = add_adapter_owned_route(&interface, route) {
+                return Err(handoff_failed_installation(
+                    interrupted,
+                    &original,
+                    &recovery,
+                    error,
+                ));
+            }
             recovery.mark_route_applied(index);
         }
         Ok(Self {
             original,
             recovery,
+            capture_routes_withdrawn: false,
+            interface_state_restored: false,
             restored: false,
         })
     }
@@ -1104,29 +1336,142 @@ impl RouteTransaction {
         &self.recovery
     }
 
-    pub fn restore(mut self) -> Result<SystemNetworkSnapshot, RouteError> {
-        let result = self.recovery.restore_owned();
-        self.restored = result.is_ok();
-        result.map(|()| self.original.clone())
+    /// Withdraws every application-owned route while the Wintun session is
+    /// still alive. This phase is idempotent and must complete before the
+    /// caller ends that session.
+    pub fn withdraw_capture_routes(&mut self) -> Result<(), RouteError> {
+        if self.capture_routes_withdrawn {
+            return Ok(());
+        }
+        self.recovery.withdraw_owned_routes()?;
+        self.capture_routes_withdrawn = true;
+        Ok(())
+    }
+
+    /// Restores addresses and interface settings only after capture routes
+    /// have been withdrawn and the caller has ended the Wintun session.
+    pub fn restore_interface_state_after_session(&mut self) -> Result<(), RouteError> {
+        if !self.capture_routes_withdrawn {
+            return Err(RouteError::InvalidPlan(
+                "capture routes must be withdrawn before interface restoration",
+            ));
+        }
+        if self.interface_state_restored {
+            return Ok(());
+        }
+        self.recovery.restore_interface_state()?;
+        self.interface_state_restored = true;
+        Ok(())
+    }
+
+    pub fn finish_ordered_cleanup(mut self) -> Result<SystemNetworkSnapshot, RouteError> {
+        if !self.capture_routes_withdrawn || !self.interface_state_restored {
+            return Err(RouteError::InvalidPlan(
+                "ordered route transaction cleanup is incomplete",
+            ));
+        }
+        self.restored = true;
+        Ok(self.original.clone())
+    }
+
+    pub(crate) fn mark_ordered_cleanup_complete(&mut self) {
+        debug_assert!(self.capture_routes_withdrawn && self.interface_state_restored);
+        self.restored = true;
     }
 }
 
 impl Drop for RouteTransaction {
     fn drop(&mut self) {
-        if !self.restored {
-            let _ = self.recovery.restore_owned();
-            self.restored = true;
+        if route_transaction_drop_action(self.restored, self.capture_routes_withdrawn)
+            == RouteTransactionDropAction::WithdrawRoutes
+        {
+            // A transaction does not own the Wintun session and therefore may
+            // not restore addresses/settings from Drop: the session could
+            // still be alive. It may only make the prerequisite route
+            // withdrawal attempt. EpochResources performs the later phases,
+            // while the durable journal retains anything not restored here.
+            let _ = self.recovery.withdraw_owned_routes();
         }
     }
 }
 
-fn fail_after_rollback(recovery: &RecoveryPlan, primary: RouteError) -> RouteError {
-    match recovery.restore_owned() {
-        Ok(()) => primary,
-        Err(rollback) => rollback,
+fn mutate_after_first_mandatory_verification<T>(
+    exclusions: &[MandatoryExclusion],
+    verified: &mut bool,
+    mutate: impl FnOnce() -> Result<T, RouteError>,
+) -> Result<T, RouteError> {
+    mutate_after_first_verification_with(
+        verified,
+        || verify_mandatory_exclusions(exclusions),
+        mutate,
+    )
+}
+
+fn mutate_after_first_verification_with<T, E>(
+    verified: &mut bool,
+    verify: impl FnOnce() -> Result<(), E>,
+    mutate: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    if *verified {
+        return mutate();
+    }
+    verify()?;
+    *verified = true;
+    mutate()
+}
+
+fn ensure_adapter_owned_route(
+    expected_interface: &InterfaceIdentity,
+    route: &OwnedRoute,
+) -> Result<(), RouteError> {
+    if route.interface == *expected_interface {
+        Ok(())
+    } else {
+        Err(RouteError::OwnershipMismatch("route interface"))
     }
 }
 
+fn add_adapter_owned_route(
+    expected_interface: &InterfaceIdentity,
+    route: &OwnedRoute,
+) -> Result<(), RouteError> {
+    with_adapter_owned_route(expected_interface, route, platform::add_route)
+}
+
+fn remove_adapter_owned_route(
+    expected_interface: &InterfaceIdentity,
+    route: &OwnedRoute,
+) -> Result<(), RouteError> {
+    with_adapter_owned_route(expected_interface, route, platform::remove_route)
+}
+
+fn with_adapter_owned_route<T>(
+    expected_interface: &InterfaceIdentity,
+    route: &OwnedRoute,
+    operation: impl FnOnce(&OwnedRoute) -> Result<T, RouteError>,
+) -> Result<T, RouteError> {
+    ensure_adapter_owned_route(expected_interface, route)?;
+    operation(route)
+}
+
+fn handoff_failed_installation(
+    interrupted: &mut Option<RouteTransaction>,
+    original: &SystemNetworkSnapshot,
+    recovery: &RecoveryPlan,
+    primary: RouteError,
+) -> RouteError {
+    debug_assert!(interrupted.is_none());
+    *interrupted = Some(RouteTransaction {
+        original: original.clone(),
+        recovery: recovery.clone(),
+        capture_routes_withdrawn: false,
+        interface_state_restored: false,
+        restored: false,
+    });
+    primary
+}
+
+#[cfg(any(windows, test))]
 fn should_restore_interface_setting(
     setting: &OwnedInterfaceSetting,
     current_mtu: u32,
@@ -1148,93 +1493,115 @@ fn should_restore_interface_setting(
     Err(RouteError::OwnershipMismatch("interface configuration"))
 }
 
-fn verify_prepared_setting_unchanged(
-    setting: &OwnedInterfaceSetting,
-    current_mtu: u32,
-    current_metric: u32,
-    current_automatic_metric: bool,
-) -> Result<(), RouteError> {
-    if current_mtu == setting.original_mtu
-        && current_metric == setting.original_metric
-        && current_automatic_metric == setting.original_automatic_metric
-    {
-        Ok(())
-    } else {
-        Err(RouteError::OwnershipMismatch(
-            "prepared interface configuration",
-        ))
+#[cfg(any(windows, test))]
+fn should_remove_owned_resource(
+    exact_matches: usize,
+    conflicting_matches: usize,
+    resource: &'static str,
+) -> Result<bool, RouteError> {
+    match (exact_matches, conflicting_matches) {
+        (0, 0) => Ok(false),
+        (1, 0) => Ok(true),
+        _ => Err(RouteError::OwnershipMismatch(resource)),
     }
 }
 
-fn verify_prepared_resource_absent(
-    present: bool,
-    resource: &'static str,
-) -> Result<(), RouteError> {
-    if present {
-        Err(RouteError::OwnershipMismatch(resource))
-    } else {
-        Ok(())
+fn valid_resource_state_successor<T: PartialEq>(
+    previous_resources: &[T],
+    previous_states: &[OwnershipState],
+    next_resources: &[T],
+    next_states: &[OwnershipState],
+) -> Option<usize> {
+    if previous_states.len() != previous_resources.len()
+        || next_states.len() != next_resources.len()
+        || next_resources.len() < previous_resources.len()
+        || next_resources.len() > previous_resources.len() + 1
+        || !next_resources.starts_with(previous_resources)
+    {
+        return None;
     }
+
+    let mut changes = 0;
+    for (previous, next) in previous_states.iter().zip(next_states) {
+        match (*previous, *next) {
+            (OwnershipState::Prepared, OwnershipState::Applied) => changes += 1,
+            (left, right) if left == right => {}
+            _ => return None,
+        }
+    }
+    if next_resources.len() == previous_resources.len() + 1 {
+        if next_states.last() != Some(&OwnershipState::Prepared) {
+            return None;
+        }
+        changes += 1;
+    }
+    (changes <= 1).then_some(changes)
 }
 
 #[derive(Clone, Copy)]
 enum RouteRestoreScope {
-    All,
-    AdapterOnly,
+    RoutesOnly,
+    AdapterRoutesOnly,
+    InterfaceStateOnly,
+}
+
+fn restore_interface_state_after_routes<E>(
+    withdraw_routes: impl FnOnce() -> Result<(), E>,
+    restore_interface_state: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    withdraw_routes()?;
+    restore_interface_state()
+}
+
+fn count_reverse_cleanup_failures<T>(
+    resources: &[T],
+    mut cleanup: impl FnMut(usize, &T) -> Result<(), RouteError>,
+) -> usize {
+    resources
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(index, resource)| cleanup(*index, resource).is_err())
+        .count()
 }
 
 fn rollback(recovery: &RecoveryPlan, scope: RouteRestoreScope) -> Result<(), RouteError> {
-    let route_failures = recovery
-        .routes
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, route)| {
-            matches!(scope, RouteRestoreScope::All) || recovery.adapter_owns_route(route)
-        })
-        .filter(|(index, route)| {
-            match recovery.route_state(*index) {
-                OwnershipState::Prepared => platform::verify_prepared_route_absent(route),
-                OwnershipState::Applied => platform::remove_route(route),
+    let restore_routes = !matches!(scope, RouteRestoreScope::InterfaceStateOnly);
+    let restore_interface_state = matches!(scope, RouteRestoreScope::InterfaceStateOnly);
+    let route_failures = if restore_routes {
+        count_reverse_cleanup_failures(&recovery.routes, |index, route| {
+            if matches!(scope, RouteRestoreScope::AdapterRoutesOnly)
+                && !recovery.adapter_owns_route(route)
+            {
+                return Ok(());
             }
-            .is_err()
+            // A Prepared write-ahead record may mean either that the
+            // native mutation never happened or that it succeeded before
+            // the Applied journal transition failed. Exact idempotent
+            // removal safely reconciles both states; mismatches fail
+            // closed in the native layer.
+            let _state = recovery.route_state(index);
+            remove_adapter_owned_route(&recovery.tun_interface, route)
         })
-        .count();
-    let address_failures = recovery
-        .interface_addresses
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(index, address)| {
-            match recovery.address_state(*index) {
-                OwnershipState::Prepared => {
-                    platform::verify_prepared_address_absent(&recovery.tun_interface, address)
-                }
-                OwnershipState::Applied => {
-                    platform::remove_interface_address(&recovery.tun_interface, address)
-                }
-            }
-            .is_err()
+    } else {
+        0
+    };
+    let address_failures = if restore_interface_state {
+        count_reverse_cleanup_failures(&recovery.interface_addresses, |index, address| {
+            let _state = recovery.address_state(index);
+            platform::remove_interface_address(&recovery.tun_interface, address)
         })
-        .count();
-    let setting_failures = recovery
-        .interface_settings
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(index, setting)| {
-            match recovery.setting_state(*index) {
-                OwnershipState::Prepared => platform::verify_prepared_interface_configuration(
-                    &recovery.tun_interface,
-                    setting,
-                ),
-                OwnershipState::Applied => {
-                    platform::restore_interface_configuration(&recovery.tun_interface, setting)
-                }
-            }
-            .is_err()
+    } else {
+        0
+    };
+    let setting_failures = if restore_interface_state {
+        count_reverse_cleanup_failures(&recovery.interface_settings, |index, setting| {
+            let _state = recovery.setting_state(index);
+            platform::restore_interface_configuration(&recovery.tun_interface, setting)
         })
-        .count();
+    } else {
+        0
+    };
     let failed_routes = route_failures + address_failures + setting_failures;
     if failed_routes == 0 {
         Ok(())
@@ -1285,8 +1652,14 @@ fn validate_interface_address(
 }
 
 fn route_specs(plan: &RoutePlan) -> Vec<OwnedRoute> {
-    let mut routes =
-        Vec::with_capacity(4 + plan.shadow_capture_prefixes.len() + plan.exclusions.len());
+    // Mandatory exclusions are operator-owned, read-only preconditions. They
+    // are verified separately and must never become application-owned routes.
+    let exclusion_prefixes = plan
+        .exclusions
+        .iter()
+        .map(MandatoryExclusion::host_prefix)
+        .collect::<HashSet<_>>();
+    let mut routes = Vec::with_capacity(4 + plan.shadow_capture_prefixes.len());
     if plan.enable_ipv4 {
         routes.extend(CAPTURE_V4_PREFIXES.map(|prefix| OwnedRoute {
             destination_prefix: prefix.to_owned(),
@@ -1306,6 +1679,7 @@ fn route_specs(plan: &RoutePlan) -> Vec<OwnedRoute> {
     routes.extend(
         plan.shadow_capture_prefixes
             .iter()
+            .filter(|prefix| !exclusion_prefixes.contains(prefix.as_str()))
             .map(|prefix| OwnedRoute {
                 destination_prefix: prefix.clone(),
                 interface: plan.tun_interface.clone(),
@@ -1317,15 +1691,6 @@ fn route_specs(plan: &RoutePlan) -> Vec<OwnedRoute> {
                 metric: plan.metric,
             }),
     );
-    routes.extend(plan.exclusions.iter().map(|exclusion| OwnedRoute {
-        destination_prefix: match exclusion.destination {
-            IpAddr::V4(address) => format!("{address}/32"),
-            IpAddr::V6(address) => format!("{address}/128"),
-        },
-        interface: exclusion.physical_interface.clone(),
-        next_hop: exclusion.physical_gateway,
-        metric: 1,
-    }));
     routes
 }
 
@@ -1444,10 +1809,11 @@ fn now_unix_ms() -> u128 {
 mod platform {
     use super::{
         InterfaceAddress, InterfaceIdentity, IpFamily, MAX_SNAPSHOT_SECTION_BYTES,
-        OwnedInterfaceSetting, OwnedRoute, PhysicalInterface, RouteBinding, RouteError, RoutePlan,
-        SystemNetworkSnapshot, format_network_prefix, now_unix_ms, parse_network_prefix,
+        MandatoryExclusion, ObservedHostRoute, OwnedInterfaceSetting, OwnedRoute,
+        PhysicalInterface, RouteBinding, RouteError, RoutePlan, SystemNetworkSnapshot,
+        format_network_prefix, now_unix_ms, parse_network_prefix, should_remove_owned_resource,
         should_restore_interface_setting, validate_discovered_binding,
-        verify_prepared_resource_absent, verify_prepared_setting_unchanged,
+        validate_mandatory_host_route_state,
     };
     use serde_json::{Value, json};
     use std::ffi::c_void;
@@ -1594,6 +1960,38 @@ mod platform {
         Ok(found)
     }
 
+    pub(super) fn verify_mandatory_exclusions(
+        exclusions: &[MandatoryExclusion],
+    ) -> Result<(), RouteError> {
+        let rows = route_rows()?;
+        for exclusion in exclusions {
+            verify_interface(&exclusion.physical_interface)?;
+            let expected_prefix = exclusion.host_prefix();
+            let exact_prefix_rows = rows
+                .iter()
+                .filter(|row| row_prefix(row).as_deref() == Some(expected_prefix.as_str()))
+                .map(|row| {
+                    ip_from_sockaddr(&row.NextHop).map(|next_hop| ObservedHostRoute {
+                        interface_index: row.InterfaceIndex,
+                        interface_luid: unsafe { row.InterfaceLuid.Value },
+                        next_hop,
+                        metric: row.Metric,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or(RouteError::SnapshotEncoding)?;
+
+            let (best, _, best_prefix) = best_route_details(exclusion.destination, None)?;
+            validate_mandatory_host_route_state(
+                exclusion,
+                &exact_prefix_rows,
+                &best,
+                &best_prefix,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn add_route(route: &OwnedRoute) -> Result<(), RouteError> {
         verify_interface(&route.interface)?;
         // Recheck immediately before the atomic create. The initial planning
@@ -1668,19 +2066,6 @@ mod platform {
         }
     }
 
-    pub(super) fn verify_prepared_address_absent(
-        interface: &InterfaceIdentity,
-        address: &InterfaceAddress,
-    ) -> Result<(), RouteError> {
-        if !interface_is_current(interface)? {
-            return Ok(());
-        }
-        let present = unicast_rows()?
-            .iter()
-            .any(|row| address_row_matches(row, interface, address, false));
-        verify_prepared_resource_absent(present, "prepared interface address")
-    }
-
     pub(super) fn remove_interface_address(
         interface: &InterfaceIdentity,
         address: &InterfaceAddress,
@@ -1689,20 +2074,25 @@ mod platform {
             return Ok(());
         }
         let rows = unicast_rows()?;
-        let Some(row) = rows
+        let related = rows
             .iter()
-            .find(|row| address_row_matches(row, interface, address, true))
+            .filter(|row| address_row_matches(row, interface, address, false))
+            .collect::<Vec<_>>();
+        let exact = related
+            .iter()
             .copied()
-        else {
-            return if rows
-                .iter()
-                .any(|row| address_row_matches(row, interface, address, false))
-            {
-                Err(RouteError::OwnershipMismatch("interface address"))
-            } else {
-                Ok(())
-            };
-        };
+            .filter(|row| address_row_matches(row, interface, address, true))
+            .collect::<Vec<_>>();
+        let exact_count = exact.len();
+        let conflicting_count = related.len().saturating_sub(exact_count);
+        if !should_remove_owned_resource(exact_count, conflicting_count, "interface address")? {
+            return Ok(());
+        }
+        let row = exact
+            .first()
+            .copied()
+            .copied()
+            .ok_or(RouteError::OwnershipMismatch("interface address"))?;
         let status = unsafe { DeleteUnicastIpAddressEntry(&row) };
         if status == NO_ERROR || is_not_found(status) {
             Ok(())
@@ -1719,17 +2109,25 @@ mod platform {
             return Ok(());
         }
         let rows = route_rows()?;
-        let Some(row) = rows
+        let related = rows
             .iter()
-            .find(|row| route_row_matches(row, route, true))
+            .filter(|row| route_row_matches(row, route, false))
+            .collect::<Vec<_>>();
+        let exact = related
+            .iter()
             .copied()
-        else {
-            return if rows.iter().any(|row| route_row_matches(row, route, false)) {
-                Err(RouteError::OwnershipMismatch("route"))
-            } else {
-                Ok(())
-            };
-        };
+            .filter(|row| route_row_matches(row, route, true))
+            .collect::<Vec<_>>();
+        let exact_count = exact.len();
+        let conflicting_count = related.len().saturating_sub(exact_count);
+        if !should_remove_owned_resource(exact_count, conflicting_count, "route")? {
+            return Ok(());
+        }
+        let row = exact
+            .first()
+            .copied()
+            .copied()
+            .ok_or(RouteError::OwnershipMismatch("route"))?;
         let status = unsafe { DeleteIpForwardEntry2(&row) };
         if status == NO_ERROR || is_not_found(status) {
             Ok(())
@@ -1739,16 +2137,6 @@ mod platform {
                 code: status,
             })
         }
-    }
-
-    pub(super) fn verify_prepared_route_absent(route: &OwnedRoute) -> Result<(), RouteError> {
-        if !interface_is_current(&route.interface)? {
-            return Ok(());
-        }
-        let present = route_rows()?
-            .iter()
-            .any(|row| route_row_matches(row, route, false));
-        verify_prepared_resource_absent(present, "prepared route")
     }
 
     pub(super) fn ensure_interface_address_absent(
@@ -1863,17 +2251,6 @@ mod platform {
         }
     }
 
-    pub(super) fn verify_prepared_interface_configuration(
-        interface: &InterfaceIdentity,
-        setting: &OwnedInterfaceSetting,
-    ) -> Result<(), RouteError> {
-        if !interface_is_current(interface)? {
-            return Ok(());
-        }
-        let row = get_interface_row(interface, setting.family)?;
-        verify_prepared_setting_unchanged(setting, row.NlMtu, row.Metric, row.UseAutomaticMetric)
-    }
-
     pub(super) fn restore_interface_configuration(
         interface: &InterfaceIdentity,
         setting: &OwnedInterfaceSetting,
@@ -1935,6 +2312,34 @@ mod platform {
             .into_iter()
             .find(|adapter| adapter.identity.interface_luid == interface_luid)
             .map(|adapter| adapter.identity))
+    }
+
+    pub(super) fn find_interface_by_guid(
+        interface_guid: &str,
+    ) -> Result<Option<InterfaceIdentity>, RouteError> {
+        let guid = interface_guid.as_bytes();
+        if guid.len() != 36
+            || guid.iter().enumerate().any(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte != b'-'
+                } else {
+                    !byte.is_ascii_hexdigit()
+                }
+            })
+        {
+            return Err(RouteError::InvalidPlan("interface GUID is invalid"));
+        }
+        Ok(adapter_records()?
+            .into_iter()
+            .find(|adapter| adapter.identity.interface_guid == interface_guid)
+            .map(|adapter| adapter.identity))
+    }
+
+    pub(super) fn interface_identities() -> Result<Vec<InterfaceIdentity>, RouteError> {
+        Ok(adapter_records()?
+            .into_iter()
+            .map(|adapter| adapter.identity)
+            .collect())
     }
 
     pub(super) fn verify_interface(interface: &InterfaceIdentity) -> Result<(), RouteError> {
@@ -2003,20 +2408,21 @@ mod platform {
     }
 
     fn best_route(destination: IpAddr) -> Result<(RouteBinding, u32), RouteError> {
-        best_route_impl(destination, None)
+        best_route_details(destination, None).map(|(binding, metric, _prefix)| (binding, metric))
     }
 
     fn best_route_constrained(
         destination: IpAddr,
         expected_interface: &InterfaceIdentity,
     ) -> Result<(RouteBinding, u32), RouteError> {
-        best_route_impl(destination, Some(expected_interface))
+        best_route_details(destination, Some(expected_interface))
+            .map(|(binding, metric, _prefix)| (binding, metric))
     }
 
-    fn best_route_impl(
+    fn best_route_details(
         destination: IpAddr,
         expected_interface: Option<&InterfaceIdentity>,
-    ) -> Result<(RouteBinding, u32), RouteError> {
+    ) -> Result<(RouteBinding, u32, String), RouteError> {
         let destination_address = sockaddr_from_ip(destination, 0);
         let mut route = MIB_IPFORWARD_ROW2::default();
         let mut source = SOCKADDR_INET::default();
@@ -2055,6 +2461,7 @@ mod platform {
         }
         let source = ip_from_sockaddr(&source).ok_or(RouteError::SnapshotEncoding)?;
         let next_hop = ip_from_sockaddr(&route.NextHop).ok_or(RouteError::SnapshotEncoding)?;
+        let prefix = row_prefix(&route).ok_or(RouteError::SnapshotEncoding)?;
         Ok((
             RouteBinding {
                 interface,
@@ -2062,6 +2469,7 @@ mod platform {
                 next_hop,
             },
             route.Metric,
+            prefix,
         ))
     }
 
@@ -2193,7 +2601,10 @@ mod platform {
             && (!exact_prefix || row.OnLinkPrefixLength == address.prefix_length)
             && (!exact_prefix
                 || (row.PrefixOrigin == IpPrefixOriginManual
-                    && row.SuffixOrigin == IpSuffixOriginManual))
+                    && row.SuffixOrigin == IpSuffixOriginManual
+                    && row.ValidLifetime == u32::MAX
+                    && row.PreferredLifetime == u32::MAX
+                    && !row.SkipAsSource))
     }
 
     fn row_prefix(row: &MIB_IPFORWARD_ROW2) -> Option<String> {
@@ -2479,8 +2890,8 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::{
-        InterfaceAddress, InterfaceIdentity, IpFamily, OwnedInterfaceSetting, OwnedRoute,
-        PhysicalInterface, RouteBinding, RouteError, RoutePlan, SystemNetworkSnapshot,
+        InterfaceAddress, InterfaceIdentity, IpFamily, MandatoryExclusion, OwnedInterfaceSetting,
+        OwnedRoute, PhysicalInterface, RouteBinding, RouteError, RoutePlan, SystemNetworkSnapshot,
     };
 
     pub(super) fn capture_snapshot() -> Result<SystemNetworkSnapshot, RouteError> {
@@ -2507,6 +2918,12 @@ mod platform {
         Err(RouteError::UnsupportedPlatform)
     }
 
+    pub(super) fn verify_mandatory_exclusions(
+        _exclusions: &[MandatoryExclusion],
+    ) -> Result<(), RouteError> {
+        Err(RouteError::UnsupportedPlatform)
+    }
+
     pub(super) fn resolve_interface_identity(
         _interface_index: u32,
     ) -> Result<InterfaceIdentity, RouteError> {
@@ -2522,6 +2939,16 @@ mod platform {
     pub(super) fn find_interface_by_luid(
         _interface_luid: u64,
     ) -> Result<Option<InterfaceIdentity>, RouteError> {
+        Err(RouteError::UnsupportedPlatform)
+    }
+
+    pub(super) fn find_interface_by_guid(
+        _interface_guid: &str,
+    ) -> Result<Option<InterfaceIdentity>, RouteError> {
+        Err(RouteError::UnsupportedPlatform)
+    }
+
+    pub(super) fn interface_identities() -> Result<Vec<InterfaceIdentity>, RouteError> {
         Err(RouteError::UnsupportedPlatform)
     }
 
@@ -2563,13 +2990,6 @@ mod platform {
         Err(RouteError::UnsupportedPlatform)
     }
 
-    pub(super) fn verify_prepared_interface_configuration(
-        _interface: &InterfaceIdentity,
-        _setting: &OwnedInterfaceSetting,
-    ) -> Result<(), RouteError> {
-        Err(RouteError::UnsupportedPlatform)
-    }
-
     pub(super) fn restore_interface_configuration(
         _interface: &InterfaceIdentity,
         _setting: &OwnedInterfaceSetting,
@@ -2595,13 +3015,6 @@ mod platform {
         Err(RouteError::UnsupportedPlatform)
     }
 
-    pub(super) fn verify_prepared_address_absent(
-        _interface: &InterfaceIdentity,
-        _address: &InterfaceAddress,
-    ) -> Result<(), RouteError> {
-        Err(RouteError::UnsupportedPlatform)
-    }
-
     pub(super) fn remove_interface_address(
         _interface: &InterfaceIdentity,
         _address: &InterfaceAddress,
@@ -2612,15 +3025,13 @@ mod platform {
     pub(super) fn remove_route(_route: &OwnedRoute) -> Result<(), RouteError> {
         Err(RouteError::UnsupportedPlatform)
     }
-
-    pub(super) fn verify_prepared_route_absent(_route: &OwnedRoute) -> Result<(), RouteError> {
-        Err(RouteError::UnsupportedPlatform)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
 
     fn identity(interface_index: u32, alias: &str) -> InterfaceIdentity {
         InterfaceIdentity {
@@ -2629,6 +3040,138 @@ mod tests {
             interface_guid: format!("00000000-0000-0000-0000-{interface_index:012x}"),
             alias: alias.to_owned(),
         }
+    }
+
+    #[test]
+    fn partial_route_cleanup_retries_every_route_idempotently() {
+        let routes = [0_u8, 1, 2, 3];
+        let mut present = routes.into_iter().collect::<HashSet<_>>();
+        let mut fail_once = Some(2_u8);
+        let mut attempts = Vec::new();
+
+        let first_failures = count_reverse_cleanup_failures(&routes, |_, route| {
+            attempts.push(*route);
+            if fail_once == Some(*route) {
+                fail_once = None;
+                return Err(RouteError::CommandFailed {
+                    operation: "test route removal",
+                    code: 5,
+                });
+            }
+            present.remove(route);
+            Ok(())
+        });
+        assert_eq!(first_failures, 1);
+        assert_eq!(attempts, [3, 2, 1, 0]);
+        assert_eq!(present, HashSet::from([2]));
+
+        attempts.clear();
+        let retry_failures = count_reverse_cleanup_failures(&routes, |_, route| {
+            attempts.push(*route);
+            present.remove(route);
+            Ok(())
+        });
+        assert_eq!(retry_failures, 0);
+        assert_eq!(attempts, [3, 2, 1, 0]);
+        assert!(present.is_empty());
+    }
+
+    #[test]
+    fn route_transaction_drop_never_restores_interface_state() {
+        assert_eq!(
+            route_transaction_drop_action(false, false),
+            RouteTransactionDropAction::WithdrawRoutes
+        );
+        assert_eq!(
+            route_transaction_drop_action(false, true),
+            RouteTransactionDropAction::PreserveJournalOnly
+        );
+        assert_eq!(
+            route_transaction_drop_action(true, true),
+            RouteTransactionDropAction::PreserveJournalOnly
+        );
+    }
+
+    #[test]
+    fn failed_installation_hands_partial_transaction_to_ordered_cleanup() {
+        let tun_interface = identity(42, "Wintun");
+        let address = InterfaceAddress {
+            address: "198.18.0.1".parse().unwrap(),
+            prefix_length: 30,
+        };
+        let route =
+            OwnedRoute::on_link_host("203.0.113.10".parse().unwrap(), tun_interface.clone(), 1)
+                .unwrap();
+        let recovery =
+            RecoveryPlan::from_parts_for_runtime_test(tun_interface, vec![address], vec![route]);
+        let original = SystemNetworkSnapshot {
+            captured_unix_ms: 1,
+            adapters_json: "[]".to_owned(),
+            routes_json: "[]".to_owned(),
+            dns_json: "[]".to_owned(),
+        };
+        let primary = RouteError::CommandFailed {
+            operation: "test installation",
+            code: 5,
+        };
+        let mut interrupted = None;
+
+        assert_eq!(
+            handoff_failed_installation(&mut interrupted, &original, &recovery, primary.clone()),
+            primary
+        );
+        let transaction = interrupted
+            .as_ref()
+            .expect("partial transaction is handed to the caller");
+        assert_eq!(transaction.original_snapshot(), &original);
+        assert_eq!(transaction.recovery_plan(), &recovery);
+        assert!(!transaction.capture_routes_withdrawn);
+        assert!(!transaction.interface_state_restored);
+        assert!(!transaction.restored);
+
+        // Prevent this fixture's best-effort Drop route call from reaching the
+        // non-Windows platform stub; the handoff state above is the assertion.
+        interrupted
+            .as_mut()
+            .expect("partial transaction remains present")
+            .restored = true;
+    }
+
+    #[test]
+    fn unproven_route_withdrawal_blocks_address_and_setting_restoration() {
+        let events = RefCell::new(Vec::new());
+        let route_error = RouteError::RollbackFailed { failed_routes: 1 };
+        let result = restore_interface_state_after_routes(
+            || {
+                events.borrow_mut().push("routes");
+                Err(route_error.clone())
+            },
+            || {
+                events.borrow_mut().push("addresses-and-settings");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(route_error));
+        assert_eq!(events.into_inner(), ["routes"]);
+    }
+
+    #[test]
+    fn proven_route_withdrawal_allows_later_interface_restoration() {
+        let events = RefCell::new(Vec::new());
+        let result = restore_interface_state_after_routes(
+            || {
+                events.borrow_mut().push("routes");
+                Ok::<_, RouteError>(())
+            },
+            || {
+                events.borrow_mut().push("addresses-and-settings");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(events.into_inner(), ["routes", "addresses-and-settings"]);
     }
 
     fn plan() -> RoutePlan {
@@ -2658,25 +3201,44 @@ mod tests {
     }
 
     #[test]
-    fn full_capture_uses_split_defaults_and_volatile_recovery() {
+    fn mandatory_exclusions_never_enter_application_owned_recovery() {
         let recovery = plan().recovery_plan().unwrap();
         let prefixes = recovery
             .owned_routes()
             .iter()
             .map(|route| route.destination_prefix.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            prefixes,
-            [
-                "0.0.0.0/1",
-                "128.0.0.0/1",
-                "::/1",
-                "8000::/1",
-                "203.0.113.10/32"
-            ]
+        assert_eq!(prefixes, ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]);
+        assert_eq!(recovery.owned_change_count(), 6);
+        assert!(!recovery.has_external_routes());
+        assert!(
+            recovery
+                .owned_routes()
+                .iter()
+                .all(|route| route.interface == plan().tun_interface)
         );
-        assert_eq!(recovery.owned_change_count(), 7);
         assert_eq!(recovery.tun_interface(), &identity(42, "Wintun"));
+    }
+
+    #[test]
+    fn mandatory_exclusion_host_prefix_cannot_reenter_as_a_shadow_route() {
+        let mut overlapping = plan();
+        overlapping
+            .shadow_capture_prefixes
+            .push("203.0.113.10/32".to_owned());
+
+        assert_eq!(
+            overlapping.validate(),
+            Err(RouteError::InvalidPlan(
+                "mandatory exclusion overlaps a shadow capture route"
+            ))
+        );
+        assert!(
+            route_specs(&overlapping)
+                .iter()
+                .all(|route| route.destination_prefix != "203.0.113.10/32")
+        );
+        assert!(overlapping.recovery_plan().is_err());
     }
 
     #[test]
@@ -2684,6 +3246,270 @@ mod tests {
         let mut invalid = plan();
         invalid.exclusions[0].physical_interface = invalid.tun_interface.clone();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn mandatory_host_route_requires_one_exact_physical_generation_and_gateway() {
+        let mut route_plan = plan();
+        let exclusion = route_plan.exclusions.remove(0);
+        assert_eq!(exclusion.host_prefix(), "203.0.113.10/32");
+        let expected = ObservedHostRoute {
+            interface_index: exclusion.physical_interface.interface_index,
+            interface_luid: exclusion.physical_interface.interface_luid,
+            next_hop: exclusion.physical_gateway,
+            metric: 4_096,
+        };
+        let best = RouteBinding {
+            interface: exclusion.physical_interface.clone(),
+            source: "192.0.2.20".parse().unwrap(),
+            next_hop: exclusion.physical_gateway,
+        };
+        assert_eq!(
+            validate_mandatory_host_route_state(&exclusion, &[expected], &best, "203.0.113.10/32"),
+            Ok(())
+        );
+        let mut different_valid_metric = expected;
+        different_valid_metric.metric = 1;
+        assert_eq!(
+            validate_mandatory_host_route_state(
+                &exclusion,
+                &[different_valid_metric],
+                &best,
+                "203.0.113.10/32"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_mandatory_host_route_state(&exclusion, &[], &best, "203.0.113.10/32"),
+            Err(RouteError::OwnershipMismatch(
+                "mandatory exclusion host route"
+            ))
+        );
+        assert_eq!(
+            validate_mandatory_host_route_state(
+                &exclusion,
+                &[expected, expected],
+                &best,
+                "203.0.113.10/32"
+            ),
+            Err(RouteError::OwnershipMismatch(
+                "mandatory exclusion host route"
+            ))
+        );
+
+        let mut wrong_index = expected;
+        wrong_index.interface_index += 1;
+        assert_eq!(
+            validate_mandatory_host_route_state(
+                &exclusion,
+                &[wrong_index],
+                &best,
+                "203.0.113.10/32"
+            ),
+            Err(RouteError::OwnershipMismatch(
+                "mandatory exclusion host route"
+            ))
+        );
+        let mut stale_generation = expected;
+        stale_generation.interface_luid += 1;
+        assert_eq!(
+            validate_mandatory_host_route_state(
+                &exclusion,
+                &[stale_generation],
+                &best,
+                "203.0.113.10/32"
+            ),
+            Err(RouteError::OwnershipMismatch(
+                "mandatory exclusion host route"
+            ))
+        );
+        let mut wrong_gateway = expected;
+        wrong_gateway.next_hop = "192.0.2.254".parse().unwrap();
+        assert_eq!(
+            validate_mandatory_host_route_state(
+                &exclusion,
+                &[wrong_gateway],
+                &best,
+                "203.0.113.10/32"
+            ),
+            Err(RouteError::OwnershipMismatch(
+                "mandatory exclusion host route"
+            ))
+        );
+        assert_eq!(
+            validate_mandatory_host_route_state(&exclusion, &[expected], &best, "0.0.0.0/0"),
+            Err(RouteError::OwnershipMismatch(
+                "mandatory exclusion best route"
+            ))
+        );
+
+        let mut wrong_best = best;
+        wrong_best.interface = identity(8, "Other Ethernet");
+        assert_eq!(
+            validate_mandatory_host_route_state(
+                &exclusion,
+                &[expected],
+                &wrong_best,
+                "203.0.113.10/32"
+            ),
+            Err(RouteError::OwnershipMismatch(
+                "mandatory exclusion best route"
+            ))
+        );
+
+        let ipv6 = MandatoryExclusion {
+            destination: "2001:db8::10".parse().unwrap(),
+            physical_interface: identity(9, "Ethernet v6"),
+            physical_gateway: "fe80::1".parse().unwrap(),
+            reason: ExclusionReason::ManagementConnection,
+        };
+        assert_eq!(ipv6.host_prefix(), "2001:db8::10/128");
+    }
+
+    #[test]
+    fn external_route_never_reaches_create_or_delete_operation() {
+        let external = OwnedRoute {
+            destination_prefix: "203.0.113.10/32".to_owned(),
+            interface: identity(7, "Ethernet"),
+            next_hop: "192.0.2.1".parse().unwrap(),
+            metric: 77,
+        };
+        let tun = identity(42, "Wintun");
+        let mut create_calls = 0;
+        assert_eq!(
+            with_adapter_owned_route(&tun, &external, |_| {
+                create_calls += 1;
+                Ok(())
+            }),
+            Err(RouteError::OwnershipMismatch("route interface"))
+        );
+        assert_eq!(create_calls, 0);
+
+        let mut delete_calls = 0;
+        assert_eq!(
+            with_adapter_owned_route(&tun, &external, |_| {
+                delete_calls += 1;
+                Ok(())
+            }),
+            Err(RouteError::OwnershipMismatch("route interface"))
+        );
+        assert_eq!(delete_calls, 0);
+    }
+
+    #[test]
+    fn mutation_and_capture_phases_use_independent_fresh_precondition_gates() {
+        let mut mutation_verified = false;
+        let mut capture_verified = false;
+        let mut verifications = 0;
+        let mut mutations = 0;
+
+        mutate_after_first_verification_with(
+            &mut mutation_verified,
+            || {
+                verifications += 1;
+                Ok::<_, ()>(())
+            },
+            || {
+                mutations += 1;
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        mutate_after_first_verification_with(
+            &mut mutation_verified,
+            || {
+                verifications += 1;
+                Ok::<_, ()>(())
+            },
+            || {
+                mutations += 1;
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(verifications, 1);
+        assert_eq!(mutations, 2);
+
+        mutate_after_first_verification_with(
+            &mut capture_verified,
+            || {
+                verifications += 1;
+                Ok::<_, ()>(())
+            },
+            || {
+                mutations += 1;
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(verifications, 2);
+        assert_eq!(mutations, 3);
+    }
+
+    #[test]
+    fn mandatory_route_failures_cause_zero_native_mutation() {
+        let mut route_plan = plan();
+        let exclusion = route_plan.exclusions.remove(0);
+        let expected = ObservedHostRoute {
+            interface_index: exclusion.physical_interface.interface_index,
+            interface_luid: exclusion.physical_interface.interface_luid,
+            next_hop: exclusion.physical_gateway,
+            metric: 37,
+        };
+        let best = RouteBinding {
+            interface: exclusion.physical_interface.clone(),
+            source: "192.0.2.20".parse().unwrap(),
+            next_hop: exclusion.physical_gateway,
+        };
+        let mut stale = expected;
+        stale.interface_luid += 1;
+        let mut mismatched = expected;
+        mismatched.next_hop = "192.0.2.254".parse().unwrap();
+        let failures = [
+            validate_mandatory_host_route_state(&exclusion, &[], &best, "203.0.113.10/32"),
+            validate_mandatory_host_route_state(
+                &exclusion,
+                &[expected, expected],
+                &best,
+                "203.0.113.10/32",
+            ),
+            validate_mandatory_host_route_state(&exclusion, &[stale], &best, "203.0.113.10/32"),
+            validate_mandatory_host_route_state(
+                &exclusion,
+                &[mismatched],
+                &best,
+                "203.0.113.10/32",
+            ),
+            validate_mandatory_host_route_state(&exclusion, &[expected], &best, "0.0.0.0/0"),
+        ];
+
+        for failure in failures {
+            let mut verified = false;
+            let mut native_mutations = 0;
+            let result = mutate_after_first_verification_with(
+                &mut verified,
+                || failure,
+                || {
+                    native_mutations += 1;
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(!verified);
+            assert_eq!(native_mutations, 0);
+        }
+    }
+
+    #[test]
+    fn duplicate_mandatory_destinations_are_rejected() {
+        let mut invalid = plan();
+        invalid.exclusions.push(invalid.exclusions[0].clone());
+        assert_eq!(
+            invalid.validate(),
+            Err(RouteError::InvalidPlan(
+                "mandatory exclusion destinations must be unique"
+            ))
+        );
     }
 
     #[test]
@@ -2699,7 +3525,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_only_recovery_excludes_every_external_interface_route() {
+    fn recovery_journal_rejects_every_external_interface_route() {
         let tun = identity(42, "Wintun");
         let adapter_route = OwnedRoute {
             destination_prefix: "0.0.0.0/1".to_owned(),
@@ -2719,7 +3545,12 @@ mod tests {
             vec![adapter_route.clone(), external_route.clone()],
         );
 
-        assert_eq!(recovery.validate_journal_state(), Ok(()));
+        assert_eq!(
+            recovery.validate_journal_state(),
+            Err(RouteError::InvalidPlan(
+                "recovery journal contains an external-interface route"
+            ))
+        );
         assert!(recovery.has_external_routes());
         assert!(recovery.adapter_owns_route(&adapter_route));
         assert!(!recovery.adapter_owns_route(&external_route));
@@ -2734,7 +3565,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn adapter_only_restore_never_calls_platform_removal_for_external_route() {
+    fn external_route_is_rejected_before_platform_removal() {
         let recovery = RecoveryPlan::from_parts_for_runtime_test(
             identity(42, "Wintun"),
             Vec::new(),
@@ -2746,10 +3577,14 @@ mod tests {
             }],
         );
 
-        // Every non-Windows platform removal returns UnsupportedPlatform. An
-        // Ok result therefore proves the external route was never dispatched
-        // to the mutation layer.
-        assert_eq!(recovery.restore_adapter_owned_only(), Ok(()));
+        // The ownership error is returned before the non-Windows mutation
+        // stub can return UnsupportedPlatform.
+        assert_eq!(
+            recovery.restore_adapter_owned_only(),
+            Err(RouteError::InvalidPlan(
+                "recovery journal contains an external-interface route"
+            ))
+        );
     }
 
     #[test]
@@ -3099,9 +3934,10 @@ mod tests {
     }
 
     #[test]
-    fn write_ahead_state_transitions_are_monotonic_and_serializable() {
-        let mut prepared = RecoveryPlan::empty(identity(42, "Wintun")).unwrap();
-        let setting_index = prepared.push_prepared_setting(OwnedInterfaceSetting {
+    fn write_ahead_state_transitions_are_single_step_monotonic_and_serializable() {
+        let empty = RecoveryPlan::empty(identity(42, "Wintun")).unwrap();
+        let mut setting_prepared = empty.clone();
+        let setting_index = setting_prepared.push_prepared_setting(OwnedInterfaceSetting {
             family: IpFamily::V4,
             original_mtu: 1500,
             original_metric: 25,
@@ -3109,21 +3945,28 @@ mod tests {
             applied_mtu: 1400,
             applied_metric: 1,
         });
-        let address_index = prepared.push_prepared_address(InterfaceAddress {
+        assert!(setting_prepared.is_valid_successor_of(&empty));
+
+        let mut address_prepared = setting_prepared.clone();
+        let address_index = address_prepared.push_prepared_address(InterfaceAddress {
             address: "198.18.0.1".parse().unwrap(),
             prefix_length: 15,
         });
-        let route_index = prepared.push_prepared_route(OwnedRoute {
+        assert!(address_prepared.is_valid_successor_of(&setting_prepared));
+
+        let mut route_prepared = address_prepared.clone();
+        let route_index = route_prepared.push_prepared_route(OwnedRoute {
             destination_prefix: "0.0.0.0/1".to_owned(),
             interface: identity(42, "Wintun"),
             next_hop: "0.0.0.0".parse().unwrap(),
             metric: 1,
         });
+        assert!(route_prepared.is_valid_successor_of(&address_prepared));
         assert_eq!(
             (
-                prepared.setting_state(setting_index),
-                prepared.address_state(address_index),
-                prepared.route_state(route_index),
+                route_prepared.setting_state(setting_index),
+                route_prepared.address_state(address_index),
+                route_prepared.route_state(route_index),
             ),
             (
                 OwnershipState::Prepared,
@@ -3132,29 +3975,68 @@ mod tests {
             )
         );
 
-        let mut applied = prepared.clone();
-        applied.mark_setting_applied(setting_index);
-        applied.mark_address_applied(address_index);
-        applied.mark_route_applied(route_index);
-        assert!(applied.is_valid_successor_of(&prepared));
-        assert!(!prepared.is_valid_successor_of(&applied));
+        let mut setting_applied = route_prepared.clone();
+        setting_applied.mark_setting_applied(setting_index);
+        assert!(setting_applied.is_valid_successor_of(&route_prepared));
+        let mut address_applied = setting_applied.clone();
+        address_applied.mark_address_applied(address_index);
+        assert!(address_applied.is_valid_successor_of(&setting_applied));
+        let mut fully_applied = address_applied.clone();
+        fully_applied.mark_route_applied(route_index);
+        assert!(fully_applied.is_valid_successor_of(&address_applied));
+        assert!(!route_prepared.is_valid_successor_of(&fully_applied));
+        assert!(fully_applied.is_valid_successor_of(&fully_applied));
 
-        let encoded = serde_json::to_vec(&applied).unwrap();
+        let mut applied_first = empty.clone();
+        let applied_first_index = applied_first.push_prepared_address(InterfaceAddress {
+            address: "198.18.0.2".parse().unwrap(),
+            prefix_length: 15,
+        });
+        applied_first.mark_address_applied(applied_first_index);
+        assert!(!applied_first.is_valid_successor_of(&empty));
+
+        let mut batch_append = empty.clone();
+        batch_append.push_prepared_address(InterfaceAddress {
+            address: "198.18.0.3".parse().unwrap(),
+            prefix_length: 15,
+        });
+        batch_append.push_prepared_route(OwnedRoute {
+            destination_prefix: "128.0.0.0/1".to_owned(),
+            interface: identity(42, "Wintun"),
+            next_hop: "0.0.0.0".parse().unwrap(),
+            metric: 1,
+        });
+        assert!(!batch_append.is_valid_successor_of(&empty));
+
+        let mut batch_apply = route_prepared.clone();
+        batch_apply.mark_setting_applied(setting_index);
+        batch_apply.mark_address_applied(address_index);
+        assert!(!batch_apply.is_valid_successor_of(&route_prepared));
+
+        let encoded = serde_json::to_vec(&fully_applied).unwrap();
         let decoded: RecoveryPlan = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded, applied);
+        assert_eq!(decoded, fully_applied);
         assert_eq!(decoded.validate_journal_state(), Ok(()));
     }
 
     #[test]
-    fn prepared_recovery_is_absence_only() {
-        assert_eq!(
-            verify_prepared_resource_absent(false, "prepared route"),
-            Ok(())
-        );
-        assert_eq!(
-            verify_prepared_resource_absent(true, "prepared route"),
-            Err(RouteError::OwnershipMismatch("prepared route"))
-        );
+    fn prepared_and_applied_recovery_reconcile_absent_exact_and_conflicting_outcomes() {
+        for state in [OwnershipState::Prepared, OwnershipState::Applied] {
+            let resource = match state {
+                OwnershipState::Prepared => "prepared route",
+                OwnershipState::Applied => "applied route",
+            };
+            assert_eq!(should_remove_owned_resource(0, 0, resource), Ok(false));
+            assert_eq!(should_remove_owned_resource(1, 0, resource), Ok(true));
+            assert_eq!(
+                should_remove_owned_resource(0, 1, resource),
+                Err(RouteError::OwnershipMismatch(resource))
+            );
+            assert_eq!(
+                should_remove_owned_resource(1, 1, resource),
+                Err(RouteError::OwnershipMismatch(resource))
+            );
+        }
 
         let setting = OwnedInterfaceSetting {
             family: IpFamily::V4,
@@ -3165,14 +4047,16 @@ mod tests {
             applied_metric: 1,
         };
         assert_eq!(
-            verify_prepared_setting_unchanged(&setting, 1500, 25, true),
-            Ok(())
+            should_restore_interface_setting(&setting, 1500, 25, true),
+            Ok(false)
         );
         assert_eq!(
-            verify_prepared_setting_unchanged(&setting, 1400, 1, false),
-            Err(RouteError::OwnershipMismatch(
-                "prepared interface configuration"
-            ))
+            should_restore_interface_setting(&setting, 1400, 1, false),
+            Ok(true)
+        );
+        assert_eq!(
+            should_restore_interface_setting(&setting, 1450, 10, false),
+            Err(RouteError::OwnershipMismatch("interface configuration"))
         );
     }
 

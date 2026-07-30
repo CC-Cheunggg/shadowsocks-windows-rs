@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod session;
 pub mod system_proxy;
 pub mod tun;
+pub mod webview2_bootstrap;
 
 use config::ConfigStore;
 use runtime::RuntimeManager;

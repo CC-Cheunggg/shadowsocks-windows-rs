@@ -33,8 +33,10 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
     "copyright": "Copyright © 2026 Shadowsocks Windows RS contributors",
     "category": "Utility",
     "shortDescription": "A modern Windows Shadowsocks client",

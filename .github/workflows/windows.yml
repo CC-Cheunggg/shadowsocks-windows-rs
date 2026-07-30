@@ -11,7 +11,7 @@ permissions:
 jobs:
   build-test-smoke-package:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       WINTUN_VERSION: 0.14.1
@@ -69,9 +69,6 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build frontend
-        run: npm run build
-
       - name: Fetch and hash-check official Wintun archive and AMD64 DLL
         shell: pwsh
         run: |
@@ -92,10 +89,69 @@ jobs:
           Write-Host "Verified Wintun $env:WINTUN_VERSION archive SHA-256 $env:WINTUN_ZIP_SHA256"
           Write-Host "Verified Wintun AMD64 DLL SHA-256 $actual"
 
-      - name: Verify Wintun outer Authenticode signature
+      - name: Verify Windows NSIS, WebView2, and artifact configuration
+        run: npm run verify:windows-bundle-config
+
+      - name: Test Windows artifact staging and manifest rules
+        run: npm run test:windows-artifact
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Check Windows Rust library and binaries
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
+
+      - name: Check all Windows Rust targets
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --all-targets
+
+      - name: Test Windows Rust library
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --lib
+
+      - name: Test all Windows Rust targets
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --all-targets
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build release Windows x86_64 MSVC executables
+        run: cargo build --manifest-path src-tauri/Cargo.toml --locked --release --bins --target x86_64-pc-windows-msvc --features custom-protocol
+
+      - name: Bundle optional NSIS setup
+        run: npm run tauri -- bundle --target x86_64-pc-windows-msvc --bundles nsis --ci --features custom-protocol
+
+      - name: Verify the three Rust executables use static MSVC CRT
+        shell: pwsh
+        run: |
+          $release = "src-tauri/target/x86_64-pc-windows-msvc/release"
+          ./scripts/verify-static-msvc-crt.ps1 -Binary @(
+            "$release/shadowsocks-windows-rs.exe",
+            "$release/network_recover.exe",
+            "$release/wintun_smoke.exe"
+          )
+
+      - name: Verify release PE subsystems
+        shell: pwsh
+        run: |
+          $release = "src-tauri/target/x86_64-pc-windows-msvc/release"
+          ./scripts/verify-windows-pe-subsystems.ps1 `
+            -MainBinary "$release/shadowsocks-windows-rs.exe" `
+            -NetworkRecoverBinary "$release/network_recover.exe" `
+            -WintunSmokeBinary "$release/wintun_smoke.exe"
+
+      - name: Verify Wintun fixed hashes and outer Authenticode signature
         shell: pwsh
         run: |
           $dll = "src-tauri/resources/wintun/amd64/wintun.dll"
+          $license = "src-tauri/resources/wintun/WINTUN-LICENSE.txt"
+          $dllHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash.ToLowerInvariant()
+          if ($dllHash -ne $env:WINTUN_DLL_SHA256) {
+            throw "Wintun DLL SHA-256 changed after the release build."
+          }
+          $licenseHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $license).Hash.ToLowerInvariant()
+          if ($licenseHash -ne $env:WINTUN_LICENSE_SHA256) {
+            throw "Wintun license SHA-256 changed after the release build."
+          }
+
           $signature = Get-AuthenticodeSignature -LiteralPath $dll
           if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
             throw "Wintun Authenticode status is $($signature.Status), expected Valid."
@@ -117,24 +173,6 @@ jobs:
           }
           Write-Host "Verified Wintun Authenticode signer: $subject"
 
-      - name: Check Rust formatting
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
-
-      - name: Check Windows Rust library and binaries
-        run: cargo check --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
-
-      - name: Check all Windows Rust targets
-        run: cargo check --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --all-targets
-
-      - name: Test Windows Rust library
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --lib
-
-      - name: Test all Windows Rust targets
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --all-targets
-
-      - name: Build Windows x86_64 MSVC release executables
-        run: cargo build --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --release --bins --features custom-protocol
-
       - name: Place verified Wintun beside release executables
         shell: pwsh
         run: |
@@ -145,17 +183,6 @@ jobs:
           if ($actual -ne $env:WINTUN_DLL_SHA256) {
             throw "Application-local Wintun DLL hash mismatch."
           }
-
-      - name: Verify packaged PE modules do not import a dynamic Microsoft CRT
-        shell: pwsh
-        run: |
-          $release = "src-tauri/target/x86_64-pc-windows-msvc/release"
-          ./scripts/verify-static-msvc-crt.ps1 -Binary @(
-            "$release/shadowsocks-windows-rs.exe",
-            "$release/network_recover.exe",
-            "$release/wintun_smoke.exe",
-            "$release/wintun.dll"
-          )
 
       - name: Capture hosted-runner default-route baseline
         shell: pwsh
@@ -214,36 +241,27 @@ jobs:
             throw ($failures -join " ")
           }
 
-      - name: Stage acceptance media and generate SHA256SUMS
+      - name: Stage exact Windows delivery files and generate audit metadata
         shell: pwsh
         run: |
           $release = "src-tauri/target/x86_64-pc-windows-msvc/release"
+          $nsisDirectory = Join-Path $release "bundle/nsis"
           $stage = Join-Path "artifacts" $env:ARTIFACT_NAME
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $env:SSWR_RUSTC_VERSION = (rustc --version)
+          $env:SSWR_NPM_VERSION = (npm --version)
+          node scripts/stage-windows-artifact.mjs `
+            --release-dir $release `
+            --nsis-dir $nsisDirectory `
+            --stage-dir $stage
 
-          $files = @(
-            @{ Source = "$release/shadowsocks-windows-rs.exe"; Destination = "shadowsocks-windows-rs.exe" },
-            @{ Source = "$release/network_recover.exe"; Destination = "network_recover.exe" },
-            @{ Source = "$release/wintun_smoke.exe"; Destination = "wintun_smoke.exe" },
-            @{ Source = "$release/wintun.dll"; Destination = "wintun.dll" },
-            @{ Source = "src-tauri/resources/wintun/WINTUN-LICENSE.txt"; Destination = "WINTUN-LICENSE.txt" },
-            @{ Source = "docs/WINDOWS_RECOVERY.md"; Destination = "WINDOWS_RECOVERY.md" }
-          )
-          foreach ($file in $files) {
-            if (-not (Test-Path -LiteralPath $file.Source -PathType Leaf)) {
-              throw "Required artifact input is missing: $($file.Source)"
-            }
-            Copy-Item -LiteralPath $file.Source -Destination (Join-Path $stage $file.Destination)
-          }
-
+      - name: Reverify staged Wintun signature and all staged hashes
+        shell: pwsh
+        run: |
+          $stage = Join-Path "artifacts" $env:ARTIFACT_NAME
           $dll = Join-Path $stage "wintun.dll"
-          $dllHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash.ToLowerInvariant()
-          if ($dllHash -ne $env:WINTUN_DLL_SHA256) {
-            throw "Staged Wintun DLL SHA-256 mismatch."
-          }
           $signature = Get-AuthenticodeSignature -LiteralPath $dll
           if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-            throw "Staged Wintun DLL failed Authenticode verification."
+            throw "Staged Wintun Authenticode status is $($signature.Status), expected Valid."
           }
           if ($null -eq $signature.SignerCertificate) {
             throw "Staged Wintun DLL has no Authenticode signer certificate."
@@ -259,67 +277,18 @@ jobs:
           if (-not $approvedSigner) {
             throw "Staged Wintun DLL has an unexpected Authenticode signer: $subject"
           }
-          $licenseHash = (
-            Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $stage "WINTUN-LICENSE.txt")
-          ).Hash.ToLowerInvariant()
-          if ($licenseHash -ne $env:WINTUN_LICENSE_SHA256) {
-            throw "Staged Wintun Prebuilt Binaries License SHA-256 mismatch."
-          }
 
-          $buildInfo = @(
-            "project=shadowsocks-windows-rs",
-            "commit=$env:GITHUB_SHA",
-            "ref=$env:GITHUB_REF",
-            "workflow_run_id=$env:GITHUB_RUN_ID",
-            "workflow_run_attempt=$env:GITHUB_RUN_ATTEMPT",
-            "target=x86_64-pc-windows-msvc",
-            "profile=release",
-            "features=custom-protocol",
-            "msvc_crt=static",
-            "rustc=$(rustc --version)",
-            "cargo=$(cargo --version)",
-            "node=$(node --version)",
-            "npm=$(npm --version)",
-            "wintun_version=$env:WINTUN_VERSION",
-            "wintun_zip_sha256=$env:WINTUN_ZIP_SHA256",
-            "wintun_dll_sha256=$dllHash",
-            "wintun_license_sha256=$licenseHash",
-            "wintun_authenticode_status=$($signature.Status)",
-            "wintun_authenticode_signer=$($signature.SignerCertificate.Subject)"
+          $setups = @(
+            Get-ChildItem -LiteralPath $stage -File |
+              Where-Object Name -Match '-setup\.exe$'
           )
-          $buildInfo | Set-Content -LiteralPath (Join-Path $stage "BUILD-INFO") -Encoding utf8NoBOM
-
-          $hashLines = Get-ChildItem -LiteralPath $stage -File |
-            Sort-Object Name |
-            ForEach-Object {
-              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-              "$hash  $($_.Name)"
-            }
-          # Use LF explicitly so standard sha256sum/shasum clients on Linux
-          # and macOS do not interpret a trailing CR as part of each filename.
-          $hashManifest = ($hashLines -join "`n") + "`n"
-          [System.IO.File]::WriteAllText(
-            (Join-Path $stage "SHA256SUMS"),
-            $hashManifest,
-            [System.Text.Encoding]::ASCII
-          )
-
-          $expected = @(
-            "BUILD-INFO",
-            "SHA256SUMS",
-            "shadowsocks-windows-rs.exe",
-            "network_recover.exe",
-            "wintun_smoke.exe",
-            "wintun.dll",
-            "WINTUN-LICENSE.txt",
-            "WINDOWS_RECOVERY.md"
-          ) | Sort-Object
-          $actual = @(Get-ChildItem -LiteralPath $stage -File | Select-Object -ExpandProperty Name | Sort-Object)
-          $difference = Compare-Object -ReferenceObject $expected -DifferenceObject $actual
-          if ($difference) {
-            $difference | Format-Table | Out-String | Write-Error
-            throw "Acceptance artifact contents differ from the required manifest."
+          if ($setups.Count -ne 1) {
+            throw "Expected exactly one staged NSIS setup, found $($setups.Count)."
           }
+          $setupName = $setups[0].Name
+          node scripts/stage-windows-artifact.mjs `
+            --stage-dir $stage `
+            --verify-only $setupName
 
       - name: Upload Windows acceptance artifact
         uses: actions/upload-artifact@v7

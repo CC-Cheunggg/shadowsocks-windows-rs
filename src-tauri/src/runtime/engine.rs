@@ -3,6 +3,8 @@ use crate::config::{AppConfig, DnsSource};
 use crate::diagnostics::Diagnostics;
 use crate::outbound::CancellationToken;
 use crate::router::{IpCidr, MandatoryGlobalExclusions, Router};
+#[cfg(any(windows, test))]
+use crate::tun::routes::InterfaceIdentity;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
@@ -106,6 +108,185 @@ pub(super) fn run(
     }
 }
 
+#[cfg(any(windows, test))]
+fn execute_after_fresh_management_verification<T, E>(
+    verify: impl FnOnce() -> Result<(), E>,
+    mutate: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    verify()?;
+    mutate()
+}
+
+#[cfg(any(windows, test))]
+fn validate_management_binding_against_physical(
+    destination: IpAddr,
+    binding: &crate::tun::routes::RouteBinding,
+    physical: &crate::tun::routes::PhysicalInterface,
+) -> Result<(), crate::tun::routes::RouteError> {
+    if binding.interface != physical.identity
+        || physical.gateway_for(destination) != Some(binding.next_hop)
+    {
+        return Err(crate::tun::routes::RouteError::OwnershipMismatch(
+            "management route confirmed physical binding",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+trait OrderedDataPathCleanup {
+    type Error;
+
+    fn stop_callbacks(&mut self);
+    fn withdraw_capture_routes(&mut self) -> Result<(), Self::Error>;
+    fn end_wintun_session(&mut self);
+    fn restore_interface_state(&mut self) -> Result<(), Self::Error>;
+    fn remove_adapter(&mut self) -> Result<(), Self::Error>;
+}
+
+#[cfg(any(windows, test))]
+fn execute_ordered_data_path_cleanup<C: OrderedDataPathCleanup>(
+    resources: &mut C,
+) -> Result<(), C::Error> {
+    resources.stop_callbacks();
+    resources.withdraw_capture_routes()?;
+    resources.end_wintun_session();
+    resources.restore_interface_state()?;
+    resources.remove_adapter()
+}
+
+#[cfg(any(windows, test))]
+fn recovery_journal_clear_allowed(
+    journal_prepared: bool,
+    cleanup_verified: bool,
+    ordered_cleanup_succeeded: bool,
+) -> bool {
+    journal_prepared && cleanup_verified && ordered_cleanup_succeeded
+}
+
+#[cfg(any(windows, test))]
+fn created_adapter_identity_matches(
+    intended_alias: &str,
+    intended_guid: &str,
+    opened_index: u32,
+    opened_luid: u64,
+    resolved: &InterfaceIdentity,
+) -> bool {
+    resolved.interface_index == opened_index
+        && resolved.interface_luid == opened_luid
+        && resolved.interface_guid == intended_guid
+        && resolved.alias == intended_alias
+}
+
+#[cfg(any(windows, test))]
+fn execute_after_adapter_intent<T>(
+    adapter_intent_recorded: bool,
+    create: impl FnOnce() -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    if !adapter_intent_recorded {
+        return Err(RuntimeError::RecoveryRequired);
+    }
+    create()
+}
+
+#[cfg(any(windows, test))]
+fn execute_after_identity_journal<T>(
+    identity_journal_recorded: bool,
+    native_call: impl FnOnce() -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    if !identity_journal_recorded {
+        return Err(RuntimeError::RecoveryRequired);
+    }
+    native_call()
+}
+
+trait OrderedRouteFallback {
+    fn withdraw_capture_routes_for_fallback(&mut self) -> bool;
+    fn restore_interface_state_for_fallback(&mut self) -> bool;
+    fn mark_fallback_cleanup_complete(&mut self);
+}
+
+#[cfg(any(windows, test))]
+impl OrderedRouteFallback for crate::tun::routes::RouteTransaction {
+    fn withdraw_capture_routes_for_fallback(&mut self) -> bool {
+        self.withdraw_capture_routes().is_ok()
+    }
+
+    fn restore_interface_state_for_fallback(&mut self) -> bool {
+        self.restore_interface_state_after_session().is_ok()
+    }
+
+    fn mark_fallback_cleanup_complete(&mut self) {
+        self.mark_ordered_cleanup_complete();
+    }
+}
+
+/// Last-resort cleanup for early-return and panic paths.
+///
+/// A plain field-order fallback is insufficient: dropping `RouteTransaction`
+/// can restore interface state before the session ends, and a failed route
+/// withdrawal would still be followed by implicit session destruction. This
+/// wrapper performs each phase explicitly. If a prerequisite cannot be
+/// proved, it intentionally retains all downstream handles for process-lifetime
+/// recovery rather than crossing the failed safety boundary.
+#[cfg(any(windows, test))]
+struct OrderedFallbackResources<M, R: OrderedRouteFallback, S, A, L> {
+    monitor: Option<M>,
+    routes: Option<R>,
+    session: Option<S>,
+    adapter: Option<A>,
+    lease: Option<L>,
+    capture_routes_may_remain: bool,
+}
+
+#[cfg(any(windows, test))]
+impl<M, R: OrderedRouteFallback, S, A, L> OrderedFallbackResources<M, R, S, A, L> {
+    fn retain_for_process_lifetime<T>(slot: &mut Option<T>) {
+        if let Some(resource) = slot.take() {
+            std::mem::forget(resource);
+        }
+    }
+
+    fn retain_from_routes_through_lease(&mut self) {
+        Self::retain_for_process_lifetime(&mut self.routes);
+        Self::retain_for_process_lifetime(&mut self.session);
+        Self::retain_for_process_lifetime(&mut self.adapter);
+        Self::retain_for_process_lifetime(&mut self.lease);
+    }
+}
+
+#[cfg(any(windows, test))]
+impl<M, R: OrderedRouteFallback, S, A, L> Drop for OrderedFallbackResources<M, R, S, A, L> {
+    fn drop(&mut self) {
+        self.monitor.take();
+
+        let routes_withdrawn = match self.routes.as_mut() {
+            Some(routes) => routes.withdraw_capture_routes_for_fallback(),
+            None => !self.capture_routes_may_remain,
+        };
+        if !routes_withdrawn {
+            self.retain_from_routes_through_lease();
+            return;
+        }
+        self.capture_routes_may_remain = false;
+
+        self.session.take();
+
+        if let Some(routes) = self.routes.as_mut() {
+            if !routes.restore_interface_state_for_fallback() {
+                Self::retain_for_process_lifetime(&mut self.routes);
+                Self::retain_for_process_lifetime(&mut self.adapter);
+                Self::retain_for_process_lifetime(&mut self.lease);
+                return;
+            }
+            routes.mark_fallback_cleanup_complete();
+        }
+        self.routes.take();
+        self.adapter.take();
+        self.lease.take();
+    }
+}
+
 #[cfg(not(windows))]
 mod platform {
     use super::*;
@@ -152,9 +333,11 @@ mod platform {
         ExclusionReason, InterfaceAddress, InterfaceIdentity, MandatoryExclusion,
         PhysicalInterface, RecoveryPlan, RouteBinding, RouteError, RoutePlan, RouteTransaction,
         SystemNetworkSnapshot, discover_primary_physical_interface, discover_route_on_interface,
-        discover_route_to, resolve_interface_identity,
+        discover_route_to, resolve_interface_identity, verify_mandatory_exclusions,
     };
-    use crate::tun::wintun::{Adapter as WintunAdapter, Session as WintunSession, Wintun};
+    use crate::tun::wintun::{
+        Adapter as WintunAdapter, AdapterGuid, Session as WintunSession, Wintun,
+    };
     use std::collections::{HashMap, VecDeque};
     use std::io::ErrorKind;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
@@ -196,12 +379,20 @@ mod platform {
     /// Normal paths call `cleanup` so a rollback failure remains observable.
     struct EpochResources {
         recovery_path: PathBuf,
-        _lease: RecoveryLease,
-        adapter: Option<WintunAdapter>,
-        session: Option<WintunSession>,
-        routes: Option<RouteTransaction>,
-        monitor: Option<NetworkChangeMonitor>,
+        fallback: OrderedFallbackResources<
+            NetworkChangeMonitor,
+            RouteTransaction,
+            WintunSession,
+            WintunAdapter,
+            RecoveryLease,
+        >,
+        adapter_intent: Option<(String, String)>,
+        adapter_observed_identity: Option<InterfaceIdentity>,
+        adapter_observed_luid: Option<u64>,
+        adapter_observed_index: Option<u32>,
         adapter_identity: Option<InterfaceIdentity>,
+        identity_journal_recorded: bool,
+        adapter_removal_pending: bool,
         journal_prepared: bool,
         cleanup_verified: bool,
         cleaned: bool,
@@ -211,12 +402,21 @@ mod platform {
         fn new(recovery_path: PathBuf, lease: RecoveryLease) -> Self {
             Self {
                 recovery_path,
-                _lease: lease,
-                adapter: None,
-                session: None,
-                routes: None,
-                monitor: None,
+                fallback: OrderedFallbackResources {
+                    monitor: None,
+                    routes: None,
+                    session: None,
+                    adapter: None,
+                    lease: Some(lease),
+                    capture_routes_may_remain: false,
+                },
+                adapter_intent: None,
+                adapter_observed_identity: None,
+                adapter_observed_luid: None,
+                adapter_observed_index: None,
                 adapter_identity: None,
+                identity_journal_recorded: false,
+                adapter_removal_pending: false,
                 journal_prepared: false,
                 cleanup_verified: true,
                 cleaned: false,
@@ -228,51 +428,103 @@ mod platform {
                 return Ok(());
             }
 
-            // Notification callbacks must be gone before owned routes,
-            // addresses, or interface settings are restored.
-            self.monitor.take();
-            self.session.take();
+            execute_ordered_data_path_cleanup(self)?;
 
-            let route_result = self.routes.take().map_or(Ok(()), |routes| {
-                routes
-                    .restore()
-                    .map(|_| ())
-                    .map_err(|error| RuntimeError::subsystem("route restoration", error))
-            });
-            let adapter_was_owned = self.adapter.is_some();
-            let adapter_result = self.adapter.take().map_or(Ok(()), |adapter| {
-                adapter
-                    .remove_owned()
-                    .map_err(|error| RuntimeError::subsystem("Wintun adapter removal", error))
-            });
-            let adapter_absence_result = if adapter_was_owned && adapter_result.is_ok() {
-                self.adapter_identity.as_ref().map_or(Ok(()), |identity| {
-                    recovery::wait_for_adapter_absent(identity, ADAPTER_REMOVAL_TIMEOUT)
-                })
-            } else {
-                Ok(())
-            };
-
-            let clear_result = if self.journal_prepared
-                && self.cleanup_verified
-                && route_result.is_ok()
-                && adapter_result.is_ok()
-                && adapter_absence_result.is_ok()
-            {
+            let clear_result = if recovery_journal_clear_allowed(
+                self.journal_prepared,
+                self.cleanup_verified,
+                true,
+            ) {
                 recovery::clear(&self.recovery_path)
             } else {
                 Ok(())
             };
 
             self.cleaned = true;
-            route_result?;
-            adapter_result?;
-            adapter_absence_result?;
             clear_result?;
             if self.journal_prepared && (!self.cleanup_verified || self.recovery_path.exists()) {
                 return Err(RuntimeError::RecoveryRequired);
             }
             self.journal_prepared = false;
+            Ok(())
+        }
+    }
+
+    impl OrderedDataPathCleanup for EpochResources {
+        type Error = RuntimeError;
+
+        fn stop_callbacks(&mut self) {
+            // The packet driver has already stopped accepting flows. Remove
+            // notifications before any owned network object is changed.
+            self.fallback.monitor.take();
+        }
+
+        fn withdraw_capture_routes(&mut self) -> Result<(), Self::Error> {
+            let result = match self.fallback.routes.as_mut() {
+                Some(routes) => routes
+                    .withdraw_capture_routes()
+                    .map_err(|error| RuntimeError::subsystem("capture route withdrawal", error)),
+                None if self.fallback.capture_routes_may_remain => {
+                    Err(RuntimeError::RecoveryRequired)
+                }
+                None => Ok(()),
+            };
+            if result.is_ok() {
+                self.fallback.capture_routes_may_remain = false;
+            }
+            result
+        }
+
+        fn end_wintun_session(&mut self) {
+            self.fallback.session.take();
+        }
+
+        fn restore_interface_state(&mut self) -> Result<(), Self::Error> {
+            let Some(routes) = self.fallback.routes.as_mut() else {
+                return Ok(());
+            };
+            routes
+                .restore_interface_state_after_session()
+                .map_err(|error| RuntimeError::subsystem("interface restoration", error))?;
+            self.fallback
+                .routes
+                .take()
+                .expect("route transaction exists until ordered cleanup completes")
+                .finish_ordered_cleanup()
+                .map(|_| ())
+                .map_err(|error| RuntimeError::subsystem("route restoration", error))
+        }
+
+        fn remove_adapter(&mut self) -> Result<(), Self::Error> {
+            if let Some(adapter) = self.fallback.adapter.take() {
+                self.adapter_removal_pending = true;
+                adapter
+                    .remove_owned()
+                    .map_err(|error| RuntimeError::subsystem("Wintun adapter removal", error))?;
+            }
+            if self.adapter_removal_pending {
+                if let Some(identity) = self.adapter_identity.as_ref() {
+                    recovery::wait_for_adapter_absent(identity, ADAPTER_REMOVAL_TIMEOUT)?;
+                } else if let Some((adapter_name, adapter_guid)) = self.adapter_intent.as_ref() {
+                    recovery::wait_for_created_adapter_absent(
+                        adapter_name,
+                        adapter_guid,
+                        self.adapter_observed_identity.as_ref(),
+                        self.adapter_observed_luid,
+                        self.adapter_observed_index,
+                        ADAPTER_REMOVAL_TIMEOUT,
+                    )?;
+                }
+                self.adapter_removal_pending = false;
+            } else if self.journal_prepared && self.adapter_identity.is_none() {
+                if let Some((adapter_name, adapter_guid)) = self.adapter_intent.as_ref() {
+                    recovery::wait_for_adapter_intent_absent(
+                        adapter_name,
+                        adapter_guid,
+                        Duration::ZERO,
+                    )?;
+                }
+            }
             Ok(())
         }
     }
@@ -395,37 +647,101 @@ mod platform {
             resources.cleanup()?;
             return Ok(DriverExit::Cancelled);
         }
-        resources.adapter = Some(
-            wintun
-                .create_adapter(&config.adapter_name)
-                .map_err(|error| RuntimeError::subsystem("Wintun adapter creation", error))?,
-        );
+        // Confirm the expected physical generation and gateway independently
+        // from the management host route itself. The host route must agree
+        // with the pre-Wintun default physical binding rather than self-certify
+        // whatever interface its current best-route lookup happens to return.
+        let management_physical = discover_primary_physical_interface(None)
+            .map_err(|error| RuntimeError::subsystem("physical interface discovery", error))?;
+        let (exclusions, management_bindings) =
+            build_route_exclusions(&config, &management_physical)?;
+        verify_mandatory_exclusions(&exclusions)
+            .map_err(|error| RuntimeError::subsystem("management route precondition", error))?;
+        if cancellation.is_cancelled() {
+            resources.cleanup()?;
+            return Ok(DriverExit::Cancelled);
+        }
+        let adapter_guid = AdapterGuid::generate()
+            .map_err(|error| RuntimeError::subsystem("Wintun adapter GUID generation", error))?;
+        let adapter_guid_string = adapter_guid.canonical_string();
+        recovery::prepare_adapter_intent(
+            &resources.recovery_path,
+            config.adapter_name.clone(),
+            adapter_guid_string.clone(),
+            original.clone(),
+        )?;
+        resources.journal_prepared = true;
+        resources.adapter_intent = Some((config.adapter_name.clone(), adapter_guid_string.clone()));
+        if cancellation.is_cancelled() {
+            resources.cleanup()?;
+            return Ok(DriverExit::Cancelled);
+        }
+
+        // The durable intent write can take an unbounded amount of wall time.
+        // Freshly verify the operator-owned management route again immediately
+        // before adapter creation, which is the first network mutation.
+        resources.fallback.adapter = Some(execute_after_adapter_intent(
+            resources.journal_prepared,
+            || {
+                execute_after_fresh_management_verification(
+                    || {
+                        verify_mandatory_exclusions(&exclusions).map_err(|error| {
+                            RuntimeError::subsystem("management route precondition", error)
+                        })
+                    },
+                    || {
+                        wintun
+                            .create_adapter_with_guid(&config.adapter_name, &adapter_guid)
+                            .map_err(|error| {
+                                RuntimeError::subsystem("Wintun adapter creation", error)
+                            })
+                    },
+                )
+            },
+        )?);
+        let adapter_luid = resources
+            .fallback
+            .adapter
+            .as_ref()
+            .expect("epoch owns the newly created adapter")
+            .luid();
+        resources.adapter_observed_luid = Some(adapter_luid);
         let tun_interface_index = resources
+            .fallback
             .adapter
             .as_ref()
             .expect("epoch owns the newly created adapter")
             .interface_index()
             .map_err(|error| RuntimeError::subsystem("Wintun interface lookup", error))?;
+        resources.adapter_observed_index = Some(tun_interface_index);
         let tun_interface = resolve_interface_identity(tun_interface_index)
             .map_err(|error| RuntimeError::subsystem("Wintun identity lookup", error))?;
+        resources.adapter_observed_identity = Some(tun_interface.clone());
+        if !created_adapter_identity_matches(
+            &config.adapter_name,
+            &adapter_guid_string,
+            tun_interface_index,
+            adapter_luid,
+            &tun_interface,
+        ) {
+            return Err(RuntimeError::RecoveryRequired);
+        }
         resources.adapter_identity = Some(tun_interface.clone());
         if cancellation.is_cancelled() {
             resources.cleanup()?;
             return Ok(DriverExit::Cancelled);
         }
 
-        // The first durable journal is created immediately after the adapter
-        // has a stable ifIndex/LUID/GUID identity and before further discovery
-        // or any route/address/interface mutation.
+        // Atomically upgrade the pre-creation durable intent with the complete
+        // interface generation before any address, setting, or route mutation.
         let recovery_plan = RecoveryPlan::empty(tun_interface.clone())
             .map_err(|error| RuntimeError::subsystem("route plan", error))?;
-        recovery::prepare(
+        recovery::record_adapter_identity(
             &resources.recovery_path,
-            config.adapter_name.clone(),
-            original.clone(),
+            tun_interface.clone(),
             recovery_plan,
         )?;
-        resources.journal_prepared = true;
+        resources.identity_journal_recorded = true;
         if cancellation.is_cancelled() {
             resources.cleanup()?;
             return Ok(DriverExit::Cancelled);
@@ -477,12 +793,6 @@ mod platform {
         }))
         .map_err(|error| RuntimeError::subsystem("system proxy DIRECT binding", error))?;
 
-        let (exclusions, management_bindings) =
-            build_route_exclusions(&config, tun_interface_index)?;
-        if cancellation.is_cancelled() {
-            resources.cleanup()?;
-            return Ok(DriverExit::Cancelled);
-        }
         let mut validation_bindings = physical_validation_bindings(&physical);
         validation_bindings.extend(
             confirmed_system_proxies
@@ -532,29 +842,42 @@ mod platform {
             resources.cleanup()?;
             return Ok(DriverExit::Cancelled);
         }
-        resources.session = Some(
+        let session = execute_after_identity_journal(resources.identity_journal_recorded, || {
             resources
+                .fallback
                 .adapter
                 .as_ref()
                 .expect("epoch owns the adapter before session start")
                 .start_session(WINTUN_RING_CAPACITY)
-                .map_err(|error| RuntimeError::subsystem("Wintun session start", error))?,
-        );
+                .map_err(|error| RuntimeError::subsystem("Wintun session start", error))
+        })?;
+        resources.fallback.session = Some(session);
         if cancellation.is_cancelled() {
             resources.cleanup()?;
             return Ok(DriverExit::Cancelled);
         }
 
-        let routes = match RouteTransaction::install_recording(&route_plan, |owned| {
-            if cancellation.is_cancelled() {
-                return Err(RouteError::JournalUpdateFailed);
-            }
-            recovery::record_owned(&resources.recovery_path, owned.clone())
-                .map_err(|_| RouteError::JournalUpdateFailed)
-        }) {
+        resources.fallback.capture_routes_may_remain = true;
+        let recovery_path = resources.recovery_path.clone();
+        let routes = match RouteTransaction::install_recording(
+            &route_plan,
+            &mut resources.fallback.routes,
+            |owned| {
+                if cancellation.is_cancelled() {
+                    return Err(RouteError::JournalUpdateFailed);
+                }
+                recovery::record_owned(&recovery_path, owned.clone())
+                    .map_err(|_| RouteError::JournalUpdateFailed)
+            },
+        ) {
             Ok(routes) => routes,
             Err(error) => {
-                resources.cleanup_verified = !matches!(&error, RouteError::RollbackFailed { .. });
+                // Once installation reaches a mutable phase, routes.rs hands
+                // the partial transaction into this resource slot instead of
+                // rolling back interface state while the session is alive.
+                // A missing transaction proves failure occurred before any
+                // owned mutation.
+                resources.fallback.capture_routes_may_remain = resources.fallback.routes.is_some();
                 let cancelled = cancellation.is_cancelled();
                 resources.cleanup()?;
                 if cancelled {
@@ -563,7 +886,7 @@ mod platform {
                 return Err(RuntimeError::subsystem("route installation", error));
             }
         };
-        resources.routes = Some(routes);
+        resources.fallback.routes = Some(routes);
         if cancellation.is_cancelled() {
             resources.cleanup()?;
             return Ok(DriverExit::Cancelled);
@@ -574,11 +897,12 @@ mod platform {
         // dropped before rollback for the same reason. Once registered, every
         // pre-monitor cached binding is revalidated on its original interface,
         // so a network switch during startup cannot be missed.
-        resources.monitor = Some(
+        resources.fallback.monitor = Some(
             NetworkChangeMonitor::new()
                 .map_err(|error| RuntimeError::subsystem("network change monitoring", error))?,
         );
         let network_epoch = resources
+            .fallback
             .monitor
             .as_ref()
             .expect("epoch owns the network-change monitor")
@@ -642,6 +966,7 @@ mod platform {
         }
         let loop_result = driver.run(
             resources
+                .fallback
                 .session
                 .as_ref()
                 .expect("running epoch owns a Wintun session"),
@@ -659,7 +984,7 @@ mod platform {
 
     fn build_route_exclusions(
         config: &EngineConfig,
-        tun_interface_index: u32,
+        physical: &PhysicalInterface,
     ) -> Result<(Vec<MandatoryExclusion>, Vec<(IpAddr, RouteBinding)>), RuntimeError> {
         let mut exclusions = Vec::with_capacity(config.management_exclusions.len());
         let mut bindings = Vec::with_capacity(config.management_exclusions.len());
@@ -669,7 +994,9 @@ mod platform {
             if cidr.prefix_len() != expected_prefix {
                 return Err(RuntimeError::InvalidConfiguration);
             }
-            let binding = discover_route_to(destination, Some(tun_interface_index))
+            let binding = discover_route_to(destination, None)
+                .map_err(|error| RuntimeError::subsystem("management route discovery", error))?;
+            validate_management_binding_against_physical(destination, &binding, physical)
                 .map_err(|error| RuntimeError::subsystem("management route discovery", error))?;
             exclusions.push(MandatoryExclusion {
                 destination,
@@ -1918,6 +2245,8 @@ mod tests {
     use crate::config::{
         ConnectionMode, DnsSource, RouteAction, RoutingConfig, RoutingRule, RuleMatch,
     };
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn runtime_config_never_copies_server_credentials() {
@@ -1942,5 +2271,424 @@ mod tests {
         let runtime = EngineConfig::try_from(&config).unwrap();
         assert_eq!(runtime.adapter_name, "Shadowsocks");
         assert_eq!(runtime.dns_servers.len(), 2);
+    }
+
+    fn interface_identity(
+        interface_index: u32,
+        interface_luid: u64,
+        alias: &str,
+    ) -> crate::tun::routes::InterfaceIdentity {
+        crate::tun::routes::InterfaceIdentity {
+            interface_index,
+            interface_luid,
+            interface_guid: format!("00000000-0000-0000-0000-{interface_index:012x}"),
+            alias: alias.to_owned(),
+        }
+    }
+
+    #[test]
+    fn created_adapter_requires_exact_alias_guid_luid_and_index_before_promotion() {
+        let expected = interface_identity(42, 42_042, "Shadowsocks");
+        assert!(created_adapter_identity_matches(
+            &expected.alias,
+            &expected.interface_guid,
+            expected.interface_index,
+            expected.interface_luid,
+            &expected,
+        ));
+
+        let mut mismatches = Vec::new();
+        let mut wrong_alias = expected.clone();
+        wrong_alias.alias = "Other".to_owned();
+        mismatches.push(wrong_alias);
+        let mut wrong_guid = expected.clone();
+        wrong_guid.interface_guid = "00000000-0000-0000-0000-000000000043".to_owned();
+        mismatches.push(wrong_guid);
+        let mut wrong_luid = expected.clone();
+        wrong_luid.interface_luid += 1;
+        mismatches.push(wrong_luid);
+        let mut wrong_index = expected.clone();
+        wrong_index.interface_index += 1;
+        mismatches.push(wrong_index);
+
+        for mismatch in mismatches {
+            assert!(!created_adapter_identity_matches(
+                &expected.alias,
+                &expected.interface_guid,
+                expected.interface_index,
+                expected.interface_luid,
+                &mismatch,
+            ));
+        }
+    }
+
+    #[test]
+    fn first_native_call_is_blocked_until_identity_journal_is_durable() {
+        let mut native_calls = 0;
+        assert_eq!(
+            execute_after_identity_journal(false, || {
+                native_calls += 1;
+                Ok(())
+            }),
+            Err(RuntimeError::RecoveryRequired)
+        );
+        assert_eq!(native_calls, 0);
+        assert_eq!(
+            execute_after_identity_journal(true, || {
+                native_calls += 1;
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(native_calls, 1);
+    }
+
+    #[test]
+    fn adapter_create_is_blocked_until_creation_intent_is_durable() {
+        let mut creates = 0;
+        assert_eq!(
+            execute_after_adapter_intent(false, || {
+                creates += 1;
+                Ok(())
+            }),
+            Err(RuntimeError::RecoveryRequired)
+        );
+        assert_eq!(creates, 0);
+        assert_eq!(
+            execute_after_adapter_intent(true, || {
+                creates += 1;
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(creates, 1);
+    }
+
+    #[test]
+    fn management_route_must_match_independently_confirmed_physical_binding() {
+        let physical = crate::tun::routes::PhysicalInterface {
+            identity: interface_identity(7, 70_007, "Ethernet"),
+            ipv4_source: Some("192.0.2.20".parse().unwrap()),
+            ipv6_source: Some("2001:db8::20".parse().unwrap()),
+            ipv4_gateway: Some("192.0.2.1".parse().unwrap()),
+            ipv6_gateway: Some("fe80::1".parse().unwrap()),
+            dns_servers: Vec::new(),
+            route_metric: 25,
+        };
+        let destination = "203.0.113.10".parse().unwrap();
+        let expected = crate::tun::routes::RouteBinding {
+            interface: physical.identity.clone(),
+            source: "192.0.2.20".parse().unwrap(),
+            next_hop: "192.0.2.1".parse().unwrap(),
+        };
+
+        assert_eq!(
+            validate_management_binding_against_physical(destination, &expected, &physical),
+            Ok(())
+        );
+
+        let mut wrong_generation = expected.clone();
+        wrong_generation.interface.interface_luid += 1;
+        assert!(matches!(
+            validate_management_binding_against_physical(destination, &wrong_generation, &physical),
+            Err(crate::tun::routes::RouteError::OwnershipMismatch(_))
+        ));
+
+        let mut wrong_gateway = expected;
+        wrong_gateway.next_hop = "192.0.2.254".parse().unwrap();
+        assert!(matches!(
+            validate_management_binding_against_physical(destination, &wrong_gateway, &physical),
+            Err(crate::tun::routes::RouteError::OwnershipMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn failed_fresh_management_verification_cannot_create_adapter() {
+        for failure in ["missing", "ambiguous", "stale", "mismatched", "non-winning"] {
+            let mut adapter_creations = 0;
+            let result = execute_after_fresh_management_verification(
+                || Err(failure),
+                || {
+                    adapter_creations += 1;
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Err(failure));
+            assert_eq!(adapter_creations, 0);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CleanupEvent {
+        StopCallbacks,
+        WithdrawCaptureRoutes,
+        EndSession,
+        RestoreInterfaceState,
+        RemoveAdapter,
+    }
+
+    struct FakeCleanup {
+        events: Vec<CleanupEvent>,
+        fail_at: Option<CleanupEvent>,
+    }
+
+    impl OrderedDataPathCleanup for FakeCleanup {
+        type Error = CleanupEvent;
+
+        fn stop_callbacks(&mut self) {
+            self.events.push(CleanupEvent::StopCallbacks);
+        }
+
+        fn withdraw_capture_routes(&mut self) -> Result<(), Self::Error> {
+            self.events.push(CleanupEvent::WithdrawCaptureRoutes);
+            if self.fail_at == Some(CleanupEvent::WithdrawCaptureRoutes) {
+                Err(CleanupEvent::WithdrawCaptureRoutes)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn end_wintun_session(&mut self) {
+            self.events.push(CleanupEvent::EndSession);
+        }
+
+        fn restore_interface_state(&mut self) -> Result<(), Self::Error> {
+            self.events.push(CleanupEvent::RestoreInterfaceState);
+            if self.fail_at == Some(CleanupEvent::RestoreInterfaceState) {
+                Err(CleanupEvent::RestoreInterfaceState)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn remove_adapter(&mut self) -> Result<(), Self::Error> {
+            self.events.push(CleanupEvent::RemoveAdapter);
+            if self.fail_at == Some(CleanupEvent::RemoveAdapter) {
+                Err(CleanupEvent::RemoveAdapter)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn normal_startup_failure_cancellation_and_network_change_share_cleanup_order() {
+        for trigger in [
+            "normal stop",
+            "startup failure",
+            "cancellation",
+            "network change",
+        ] {
+            let mut cleanup = FakeCleanup {
+                events: Vec::new(),
+                fail_at: None,
+            };
+
+            assert_eq!(
+                execute_ordered_data_path_cleanup(&mut cleanup),
+                Ok(()),
+                "{trigger}"
+            );
+            assert_eq!(
+                cleanup.events,
+                [
+                    CleanupEvent::StopCallbacks,
+                    CleanupEvent::WithdrawCaptureRoutes,
+                    CleanupEvent::EndSession,
+                    CleanupEvent::RestoreInterfaceState,
+                    CleanupEvent::RemoveAdapter,
+                ],
+                "{trigger}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_never_ends_session_when_capture_withdrawal_fails() {
+        let mut cleanup = FakeCleanup {
+            events: Vec::new(),
+            fail_at: Some(CleanupEvent::WithdrawCaptureRoutes),
+        };
+
+        assert_eq!(
+            execute_ordered_data_path_cleanup(&mut cleanup),
+            Err(CleanupEvent::WithdrawCaptureRoutes)
+        );
+        assert_eq!(
+            cleanup.events,
+            [
+                CleanupEvent::StopCallbacks,
+                CleanupEvent::WithdrawCaptureRoutes
+            ]
+        );
+    }
+
+    #[test]
+    fn cleanup_never_removes_adapter_when_interface_restoration_fails() {
+        let mut cleanup = FakeCleanup {
+            events: Vec::new(),
+            fail_at: Some(CleanupEvent::RestoreInterfaceState),
+        };
+
+        assert_eq!(
+            execute_ordered_data_path_cleanup(&mut cleanup),
+            Err(CleanupEvent::RestoreInterfaceState)
+        );
+        assert_eq!(
+            cleanup.events,
+            [
+                CleanupEvent::StopCallbacks,
+                CleanupEvent::WithdrawCaptureRoutes,
+                CleanupEvent::EndSession,
+                CleanupEvent::RestoreInterfaceState,
+            ]
+        );
+    }
+
+    #[test]
+    fn cleanup_failures_never_allow_recovery_journal_clear() {
+        for failure in [
+            CleanupEvent::WithdrawCaptureRoutes,
+            CleanupEvent::RestoreInterfaceState,
+            CleanupEvent::RemoveAdapter,
+        ] {
+            let mut cleanup = FakeCleanup {
+                events: Vec::new(),
+                fail_at: Some(failure),
+            };
+            let succeeded = execute_ordered_data_path_cleanup(&mut cleanup).is_ok();
+            assert!(!recovery_journal_clear_allowed(true, true, succeeded));
+        }
+        assert!(!recovery_journal_clear_allowed(true, false, true));
+        assert!(!recovery_journal_clear_allowed(false, true, true));
+        assert!(recovery_journal_clear_allowed(true, true, true));
+    }
+
+    struct DropProbe {
+        name: &'static str,
+        events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.events.borrow_mut().push(self.name);
+        }
+    }
+
+    struct FallbackRouteProbe {
+        events: Rc<RefCell<Vec<&'static str>>>,
+        fail_withdrawal: bool,
+        fail_interface_restore: bool,
+        complete: bool,
+    }
+
+    impl OrderedRouteFallback for FallbackRouteProbe {
+        fn withdraw_capture_routes_for_fallback(&mut self) -> bool {
+            self.events.borrow_mut().push("routes");
+            !self.fail_withdrawal
+        }
+
+        fn restore_interface_state_for_fallback(&mut self) -> bool {
+            self.events.borrow_mut().push("interface");
+            !self.fail_interface_restore
+        }
+
+        fn mark_fallback_cleanup_complete(&mut self) {
+            self.complete = true;
+        }
+    }
+
+    #[test]
+    fn fallback_drop_preserves_callbacks_routes_session_interface_adapter_lease_order() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let probe = |name| DropProbe {
+            name,
+            events: Rc::clone(&events),
+        };
+
+        {
+            let _resources = OrderedFallbackResources {
+                monitor: Some(probe("monitor")),
+                routes: Some(FallbackRouteProbe {
+                    events: Rc::clone(&events),
+                    fail_withdrawal: false,
+                    fail_interface_restore: false,
+                    complete: false,
+                }),
+                session: Some(probe("session")),
+                adapter: Some(probe("adapter")),
+                lease: Some(probe("lease")),
+                capture_routes_may_remain: true,
+            };
+        }
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "monitor",
+                "routes",
+                "session",
+                "interface",
+                "adapter",
+                "lease"
+            ]
+        );
+    }
+
+    #[test]
+    fn fallback_drop_does_not_end_session_after_route_withdrawal_failure() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let probe = |name| DropProbe {
+            name,
+            events: Rc::clone(&events),
+        };
+
+        {
+            let _resources = OrderedFallbackResources {
+                monitor: Some(probe("monitor")),
+                routes: Some(FallbackRouteProbe {
+                    events: Rc::clone(&events),
+                    fail_withdrawal: true,
+                    fail_interface_restore: false,
+                    complete: false,
+                }),
+                session: Some(probe("session")),
+                adapter: Some(probe("adapter")),
+                lease: Some(probe("lease")),
+                capture_routes_may_remain: true,
+            };
+        }
+
+        assert_eq!(events.borrow().as_slice(), ["monitor", "routes"]);
+    }
+
+    #[test]
+    fn fallback_drop_does_not_remove_adapter_after_interface_restore_failure() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let probe = |name| DropProbe {
+            name,
+            events: Rc::clone(&events),
+        };
+
+        {
+            let _resources = OrderedFallbackResources {
+                monitor: Some(probe("monitor")),
+                routes: Some(FallbackRouteProbe {
+                    events: Rc::clone(&events),
+                    fail_withdrawal: false,
+                    fail_interface_restore: true,
+                    complete: false,
+                }),
+                session: Some(probe("session")),
+                adapter: Some(probe("adapter")),
+                lease: Some(probe("lease")),
+                capture_routes_may_remain: true,
+            };
+        }
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["monitor", "routes", "session", "interface"]
+        );
     }
 }

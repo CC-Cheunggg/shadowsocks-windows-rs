@@ -85,26 +85,35 @@ The repository now contains:
   snapshots, stable LUID/GUID ownership checks, and an atomic write-ahead
   journal that durably records `Prepared` before each owned
   route/address/interface-setting mutation and `Applied` after native success.
+- Configured management exclusions are host CIDRs used by the user-space
+  router and by read-only startup gates. For real-machine acceptance, the
+  operator must first create and own one unique, exact, currently winning
+  physical `ActiveStore` `/32` or `/128` route for the current management
+  peer. The runtime validates its ifIndex, LUID, gateway, family, and best-route
+  selection before Wintun creation, again before the first network mutation,
+  and again before the first capture route. It never creates, updates, records
+  as owned, or deletes that physical route.
 - A nonblocking global recovery lease shared by desktop startup and recovery,
   plus cancellation gates before mutation-capable startup stages.
-- External recovery treats the user-writable journal as an untrusted recovery
-  request. Before any recorded network mutation, the application-local Wintun
-  API must open the journal's adapter alias and prove its opened LUID/ifIndex
-  plus fully resolved ifIndex/LUID/GUID/alias identity. Missing, unopenable, or
-  mismatched adapters cause zero network mutation and retain the journal as
-  `RecoveryRequired`.
-- Even after that provenance proof, external recovery mutates only routes whose
-  `route.interface` is the verified Wintun identity, plus that adapter's
-  addresses and interface settings. It never mutates a journal-selected
-  physical-interface route, including a management host exclusion. It may
-  first restore safe Wintun-owned objects, but any such external route keeps
-  the journal and returns `RecoveryRequired`.
-- Normal epoch cleanup uses its trusted in-memory route transaction rather
-  than replaying the journal, so it still removes physical management
-  exclusions created by that live transaction. After exact rollback and
-  `remove_owned`, it polls every 50 ms for at most five seconds until both
-  alias and LUID are absent; only complete rollback and verified adapter
-  absence permit journal removal.
+- The version-3 recovery journal records an adapter-creation intent containing
+  a pre-generated GUID before `WintunCreateAdapter`, then atomically promotes
+  that intent to the exact ifIndex/LUID/GUID/alias generation before session,
+  address, setting, or route mutation. Each later owned object advances through
+  one durable `Prepared -> Applied` transition.
+- External recovery treats the user-writable journal as an untrusted request.
+  Current journals may contain only routes, addresses, and settings owned by
+  the recorded Wintun generation. A current or legacy journal that claims an
+  external-interface route is rejected before native mutation and remains
+  available as `RecoveryRequired`. If the adapter exists, the fixed
+  application-local Wintun API must open it and prove the complete generation;
+  absence, ambiguity, reuse, or mismatch fails closed.
+- Normal stop, startup failure, and network-change rollback stop new flows and
+  callbacks, withdraw application-owned capture routes, end the Wintun
+  session, restore owned addresses/interface settings, remove the owned
+  adapter, and prove its absence in that order. A failed phase blocks later
+  destructive phases. The journal is cleared only after the complete ordered
+  cleanup and exact absence/restoration checks succeed; the operator-owned
+  management route remains untouched.
 - IPv4 and IPv6 parsing plus TCP/UDP checksums. Unsupported protocols,
   fragmented IPv4/IPv6, and unsupported IPv6 extension headers are counted and
   dropped rather than bypassing Wintun.
@@ -140,7 +149,8 @@ The `/1` routes are supplemented by snapshot-derived child routes for
 pre-existing more-specific LAN, host, VPN, and enterprise prefixes. Existing
 host-prefix collisions are accepted only when the planned Wintun route is
 proven to win by effective metric; configured management hosts remain explicit
-physical exceptions.
+operator-owned physical exceptions and never enter the application-owned route
+plan.
 
 ## Connection modes in this slice
 
@@ -156,6 +166,11 @@ physical exceptions.
 
 The built-in global exclusions are centralized as `127.0.0.0/8` and `::1/128`.
 Additional management exclusions must be explicit hosts (`/32` or `/128`).
+They tell the router which management peers are DIRECT and tell startup which
+pre-existing operator route to validate; they do not authorize route creation
+or ownership. The list may be empty, and the application does not discover the
+current RDP peer for the operator; real-machine acceptance must identify and
+configure it freshly.
 System-proxy exceptions are exact endpoints that passed local-network route
 validation; they never widen into a blanket LAN exemption. DNS servers,
 arbitrary targets, and future proxy servers are not silently exempted.
@@ -296,7 +311,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 Platform-independent packet, router, DNS-cache, session-lifecycle,
 backpressure/cancellation, loop-detection, recovery-journal, and safe-error
 tests run on macOS/Linux. Windows-specific route, socket-binding, Wintun, and
-desktop-bundle behavior is compiled and exercised on Windows.
+desktop-bundle behavior must be compiled in Windows Actions and exercised on
+Windows before acceptance.
 
 Development builds may use Tauri's default development protocol. Every
 release/acceptance desktop binary must be built with the Cargo
@@ -329,8 +345,8 @@ The Windows Actions workflow:
    `x86_64-pc-windows-msvc`;
 6. builds the desktop app with `custom-protocol`, plus the recovery helper and
    smoke executable, in release mode with the MSVC CRT linked statically;
-7. rejects any packaged EXE or DLL that imports a dynamic MSVC/UCRT DLL, so
-   the acceptance machine does not need the Visual C++ x64 Redistributable;
+7. rejects any of the three Rust EXEs that imports a dynamic MSVC/UCRT DLL, so
+   those executables do not need the Visual C++ x64 Redistributable;
 8. creates a uniquely named temporary Wintun adapter;
 9. assigns only TEST-NET addresses and two isolated `/32` routes through the
    native IP Helper/NetIO layer;
@@ -349,27 +365,53 @@ A hard process termination can prevent normal adapter cleanup;
 fails if a residual adapter is detected, but that mode does not itself delete
 an arbitrary residual adapter.
 
-The uploaded directory contains the desktop executable,
-`network_recover.exe`, `wintun_smoke.exe`, application-local `wintun.dll`,
-`WINTUN-LICENSE.txt`, `WINDOWS_RECOVERY.md`, `BUILD-INFO`, and `SHA256SUMS`.
-The three Rust executables statically link the MSVC CRT and therefore do not
-require a separate Visual C++ x64 Redistributable installation. Windows system
-components and the separately verified application-local Wintun DLL remain
-normal platform/runtime dependencies.
+The uploaded directory contains exactly one optional `*-setup.exe`, the raw
+desktop executable, `network_recover.exe`, `wintun_smoke.exe`,
+application-local `wintun.dll`, `LICENSE.txt`, `THIRD_PARTY_NOTICES.md`,
+`WINTUN-LICENSE.txt`, `BUILD-INFO`, and `SHA256SUMS`.
+The Windows build is configured and workflow-gated to statically link the MSVC
+CRT into all three Rust executables, so a verified artifact does not require a
+separate Visual C++ x64 Redistributable installation. Windows system components
+and the separately verified application-local Wintun DLL remain normal
+platform/runtime dependencies.
+
+The raw desktop EXE is the primary delivery form. Its Windows release build
+uses the GUI PE subsystem; the two helpers remain console applications. Before
+creating Tauri or a WebView, the raw EXE checks for an installed Evergreen
+WebView2 Runtime. The installed fast path performs no download and opens no
+initialization window. If the Runtime is missing, it displays the native,
+non-interactive message `正在初始化运行环境，请稍候…`, downloads only the
+compiled-in Microsoft Evergreen bootstrapper URL over bounded HTTPS redirects,
+verifies Microsoft Authenticode, and executes fixed `/silent /install`
+arguments. A failure shows a native actionable error and does not start the
+WebView.
+
+NSIS is only a convenience package. It uses Tauri's
+`downloadBootstrapper`/silent mode; neither the artifact nor the raw EXE embeds
+an offline installer or fixed Runtime, and the raw EXE does not require the
+user to run NSIS first. These behaviors have local unit, configuration,
+staging, and static checks. The MSVC PE/static-CRT gates and NSIS build require
+a successful Windows Actions run. Setup installation, installed resource
+layout, absence of a CMD window, and real WebView2
+detection/download/signature/UI/install behavior remain real-Windows evidence.
 The workflow definition is not evidence that a run passed: Windows test media
 must be taken only from a completed successful Actions run, and its
 `SHA256SUMS` must be verified before upload to an acceptance VM. Do not copy an
-ad hoc locally built executable to that VM. Preserve the Actions run URL and
-artifact digest with the acceptance record.
+ad hoc locally built executable to that VM. Do not reuse an old artifact,
+hash, route observation, or acceptance record for a new run. Preserve the
+Actions run URL and artifact digest with the acceptance record.
 
 Real-machine acceptance begins with read-only inspection in Microsoft Remote
 Desktop. The Actions-built isolated Wintun smoke should then be repeated on the
 test machine, followed by full DIRECT acceptance only after explicit approval,
-RDP-peer exclusion, an out-of-band console, saved snapshots, and an automatic
+the freshly identified RDP peer's configured CIDR and operator-owned exact
+physical host route, an out-of-band console, saved snapshots, and an automatic
 rollback watchdog are confirmed. See:
 
+- [docs/DEVELOPMENT_CONSTRAINTS.md](docs/DEVELOPMENT_CONSTRAINTS.md)
 - [docs/WINDOWS_RECOVERY.md](docs/WINDOWS_RECOVERY.md)
 - [docs/WINDOWS_ACCEPTANCE_TEMPLATE.md](docs/WINDOWS_ACCEPTANCE_TEMPLATE.md)
+- [docs/WINDOWS_DIRECT_ACCEPTANCE_TASKS.md](docs/WINDOWS_DIRECT_ACCEPTANCE_TASKS.md)
 
 An Actions success or a web page opening is not, by itself, acceptance. The
 out-of-band recovery and action-time authorization gates documented in those

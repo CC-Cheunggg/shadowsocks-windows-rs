@@ -5,6 +5,10 @@ boundaries. It distinguishes code and unit-test coverage from Windows CI and
 real-machine acceptance. A feature is not release-accepted merely because the
 corresponding module exists or compiles.
 
+The normative ownership and safety boundaries are in
+[DEVELOPMENT_CONSTRAINTS.md](DEVELOPMENT_CONSTRAINTS.md). They take precedence
+if this description differs.
+
 ## Scope
 
 The slice implements this path on Windows x86_64:
@@ -56,7 +60,7 @@ The following are deliberately outside this slice:
 | Module | Responsibility |
 | --- | --- |
 | `tun/wintun.rs` | Fixed-name DLL loading, Wintun function table, adapter ownership, packet session, receive-ring guard, send-ring injection, and handle cleanup |
-| `tun/routes.rs` | Physical-interface discovery, read-only network snapshots, volatile split-default routes, explicit exclusions, exact rollback |
+| `tun/routes.rs` | Physical-interface discovery, read-only network snapshots and management-route gates, volatile split-default/shadow routes, exact owned rollback |
 | `packet/` | IPv4/IPv6, TCP/UDP parsing, checksums, and UDP response packet construction |
 | `session/tcp.rs` | Thin transparent-session adapter over `smoltcp` |
 | `session/udp.rs` | Bounded five-tuple associations, queues, expiry, and cancellation |
@@ -103,6 +107,53 @@ hash, its outer Authenticode signature, the final application-local copy, and
 the uploaded `SHA256SUMS`. The project does not compile, copy, modify, or
 redistribute GPLv2 Wintun source code.
 
+## Windows desktop delivery and WebView2
+
+The raw release `shadowsocks-windows-rs.exe` is the primary desktop delivery
+form and is configured for PE subsystem 2 (Windows GUI). The independently
+usable `network_recover.exe` and `wintun_smoke.exe` helpers remain subsystem 3
+(console). The workflow reads the PE headers of all three MSVC release
+executables before staging; local GNU PE-header inspection is supplementary,
+not MSVC or real-window evidence.
+
+Before calling the Tauri application entry point, the raw Windows EXE runs a
+native Evergreen WebView2 gate:
+
+- all HKLM/HKCU 32/64-bit official Runtime registration views are checked;
+- an installed nonzero Runtime takes a strict fast path with no mutex,
+  progress window, download, or child process;
+- a missing Runtime opens a buttonless native window containing
+  `正在初始化运行环境，请稍候…`;
+- only
+  `https://go.microsoft.com/fwlink/p/?LinkId=2124703` is compiled in, WinHTTP
+  automatic redirects are disabled, and manually followed redirects must stay
+  HTTPS on the explicit Microsoft download-domain allowlist;
+- redirect count, response headers, body size, download time, mutex wait,
+  UI handshakes, installer process tree, and cleanup retries have explicit
+  per-stage bounds;
+- a create-new temporary file is held against write/delete replacement while
+  WinVerifyTrust checks the Authenticode chain and the primary certificate's
+  Organization equals `Microsoft Corporation`;
+- `CreateProcessW` receives only fixed `/silent /install` arguments and the
+  suspended process is assigned to a kill-on-close Job Object before resume;
+  only exit code 0 plus a successful post-install Runtime detection proceeds;
+  and
+- any detection, UI, download, signature, install, or cleanup failure prevents
+  Tauri/WebView creation and shows a short native executable error.
+
+The NSIS setup is an optional convenience path. Tauri uses
+`downloadBootstrapper` with `silent: true`; it does not reuse the raw EXE's
+custom WinHTTP/WinTrust state machine. The staged artifact requires exactly one
+setup as well as the raw EXE and its application-local dependencies. Neither
+path embeds an offline installer or fixed Runtime, and the raw EXE does not
+require NSIS to have run first.
+
+Platform-neutral/injected WebView2 tests, JSON/config checks, artifact staging
+tests, and static/GNU inspection are local evidence only. MSVC PE/static-CRT
+and NSIS build evidence remains assigned to Windows Actions. Real absence of a
+CMD window and native registry/WinHTTP/WinVerifyTrust/Job/UI/silent-install
+behavior remains assigned to real-Windows acceptance.
+
 ## Adapter and packet-session lifecycle
 
 On start, the runtime:
@@ -115,21 +166,32 @@ On start, the runtime:
 4. non-blockingly acquires the fixed global network-recovery lease before the
    first mutation, so a desktop start and recovery helper cannot mutate the
    same journal/network state concurrently;
-5. rechecks cancellation, loads the pinned application-local Wintun API, and
-   refuses startup if an adapter with the configured name is already openable;
-6. rechecks cancellation, creates the adapter, and resolves its
-   ifIndex/LUID/GUID/alias identity;
-7. atomically creates the initial empty recovery journal as soon as the stable
-   adapter identity exists and before route/address/interface mutation;
-8. resolves each management host and proxy candidate with `GetBestRoute2`;
-9. discovers the default physical DIRECT binding and builds shadow routes;
-10. opens a 4 MiB Wintun packet session;
-11. installs each MTU/metric, address, and route with the `Prepared`/native
-    mutation/`Applied` journal sequence;
-12. waits for every created Wintun address to reach native DAD state
+5. loads the pinned application-local Wintun API, refuses startup if the
+   configured adapter already exists, discovers the pre-Wintun physical
+   generation, resolves each configured management host, and requires its
+   unique exact operator-owned `/32` or `/128` `ActiveStore` route to match the
+   physical ifIndex/LUID/gateway/family and win the unconstrained best-route
+   lookup;
+6. generates an adapter GUID and durably creates schema-version-3
+   `adapter_creation_intent` containing the fixed alias, GUID, and original
+   snapshot before `WintunCreateAdapter`;
+7. freshly repeats the management-route gate immediately before adapter
+   creation, creates the adapter with that exact GUID, resolves its
+   ifIndex/LUID/GUID/alias, requires all four fields to match, and atomically
+   promotes the journal to `adapter_identity`;
+8. discovers the default physical DIRECT binding and confirmed proxy
+   candidates, builds the shadow/capture plan, and opens a 4 MiB packet session
+   only after the complete adapter identity is durable;
+9. repeats the management gate before the first address/interface-setting
+   mutation, then installs each application-owned setting and address through
+   one durable `Prepared` -> native call -> `Applied` transition;
+10. waits for every created Wintun address to reach native DAD state
     `Preferred`, polling every 500 ms with a 12-second limit;
-13. registers native route/interface/address change notifications;
-14. repeats bounded read-only proxy capture and revalidates the cached physical
+11. independently repeats the complete management gate immediately before the
+    first split-default/shadow capture route, then installs only Wintun-owned
+    routes through the same write-ahead sequence;
+12. registers native route/interface/address change notifications;
+13. repeats bounded read-only proxy capture and revalidates the cached physical
     DIRECT, management, and confirmed system-proxy bindings with constrained
     `GetBestRoute2` and complete stable interface/source/next-hop comparison;
     takes a fresh route snapshot, excludes only the exact Wintun ifIndex+LUID
@@ -137,39 +199,57 @@ On start, the runtime:
     it with the installed plan; and compares all external IPv4/IPv6 default
     route identities, gateways, route metrics, and interface metrics with the
     pre-mutation selection fingerprint; and
-15. publishes `running` and starts the packet driver.
+14. publishes `running` and starts the packet driver.
+
+The configuration may contain no management exclusions. The application does
+not discover an RDP peer on the operator's behalf, so real-machine acceptance
+must freshly identify that peer, configure its host CIDR, and create the
+matching operator-owned route before startup. Any failed configured-route gate
+fails closed before the guarded mutation and never creates, updates, journals,
+or deletes the physical route.
 
 Wintun receive buffers are exposed through a guard and released back to the
 ring on drop. Send packets are allocated from the Wintun send ring, filled, and
 submitted. Adapter, API library, session, and receive-packet handles use scoped
 ownership.
 
-Normal stop cancels workers, joins them, ends the Wintun session, removes the
-owned routes and addresses, removes the owned adapter, and clears the recovery
-journal only when cleanup succeeds. Startup failures attempt rollback for every
-resource already acquired. One epoch resource owner holds the global recovery
-lease, monitor, session, route transaction, adapter, and journal lifecycle; its
-explicit cleanup path makes rollback failures visible, while drop remains a
-best-effort guard for early-return and panic paths.
+Normal stop, startup failure, cancellation, and network-change rollback use
+one strict order:
+
+1. stop new flows/workers and unregister change callbacks;
+2. withdraw every application-owned split-default and shadow route while the
+   Wintun session still exists;
+3. end the packet session;
+4. remove owned addresses and exactly restore owned interface MTU/metric state;
+5. remove the application-owned adapter;
+6. prove the recorded routes/addresses/adapter generation are absent and the
+   settings are restored; and
+7. clear the recovery journal only after all earlier phases succeed.
+
+A failed route withdrawal prevents session teardown. A failed interface
+restoration prevents adapter removal. Any failure or unproved absence retains
+the journal and stops before crossing the next destructive boundary. The
+automatic early-return/panic fallback preserves this ordering; where it cannot
+prove a prerequisite, it intentionally retains downstream handles for
+process-lifetime recovery.
 
 Normal epoch cleanup trusts the in-memory `RouteTransaction` created by that
 epoch; it does not deserialize the user-writable journal for a second recovery
-pass. It deregisters the monitor, ends the session, performs exact in-memory
-rollback—including physical management exclusion routes created by that
-transaction—calls `remove_owned` on the creating adapter handle, and then
-polls every 50 ms for at most five seconds until neither the recorded alias nor
-LUID is present. The journal is cleared only when rollback ownership remained
-verified, route rollback succeeded, adapter removal succeeded, and both
-identity lookups prove absence. Any failure retains the journal and returns the
-applicable cleanup error.
+pass. Its transaction contains only Wintun-owned routes. It never contains or
+removes an operator-owned management host route. Adapter-removal verification
+uses the complete recorded generation selectors (alias, LUID, GUID, and
+ifIndex, plus any observed pre-promotion selectors) and a bounded poll. Any
+reuse, ambiguity, or residual identity keeps the journal.
 
 The independent journal uses write-through temp-file replacement and explicit
-write-ahead ownership states. Before each recorded
-route/address/interface-setting change, its complete expected identity and
-fields are durably recorded as `Prepared`; after native success, the in-memory
-state becomes `Applied` before the durable `Applied` transition. Conflicting
-pre-existing objects are checked both while planning and immediately before
-mutation.
+write-ahead ownership states. Its durable state machine is `no journal ->
+adapter_creation_intent -> adapter_identity`, followed by one new `Prepared`
+object or one `Prepared -> Applied` transition per atomic update. Before each
+recorded route/address/interface-setting change, its complete expected identity
+and fields are durable as `Prepared`; after native success, authoritative
+in-memory state becomes `Applied` before the durable transition. Batched,
+Applied-first, inconsistent, oversized, or external-interface claims are
+rejected.
 
 Independent recovery does not trust the journal alone as authority for an
 elevated network mutation. Using the fixed application-local Wintun API, it
@@ -182,37 +262,28 @@ the adapter is absent, or any identity field differs, recovery performs zero
 recorded network mutations, keeps the journal, and returns
 `RecoveryRequired`.
 
-After adapter provenance succeeds, independent recovery removes or restores
-or verifies only objects owned by that verified Wintun interface: its
-addresses, interface settings, and routes whose `route.interface` equals the
-verified TUN identity. It never mutates a route directed to any other
-interface, including a physical management host exclusion, because adapter
-provenance cannot prove that a user-writable journal's arbitrary physical route
-was application-created. Wintun-owned objects may be safely restored first,
-but the presence of any external-interface route then retains the journal and
-returns `RecoveryRequired`. Normal stop remains able to remove such a physical
-exclusion from its trusted in-memory transaction.
+Current journals can contain only objects owned by the exact recorded Wintun
+generation. A current, previous-version, or legacy journal claiming a route on
+any external interface—including a physical management route—is rejected on
+load before adapter inspection or native mutation, retains its evidence, and
+returns `RecoveryRequired`.
 
-Within the adapter-only scope, independent recovery removes or restores exact
-`Applied` objects only after complete field checks. A `Prepared` object must
-still be absent, and a prepared interface setting must still equal its recorded
-original value. An exact-present address/route or an applied-looking interface
-setting under `Prepared` is intentionally ambiguous: recovery returns
-`RecoveryRequired` and retains the journal instead of claiming or deleting it.
-This write-ahead sequence closes the prior post-mutation/pre-journal-record
-gap. A normal journal-write failure performs synchronous rollback from the
-authoritative in-memory state and reports rollback failure preferentially.
-Repeated recovery accepts exact settings already restored to their original
-values.
+Within the adapter-only scope, both `Prepared` and `Applied` records reconcile
+the same exact states because a crash can occur after native success but before
+the durable `Applied` transition. Exact absence or an already-restored setting
+is an idempotent no-op; one unique exact present route/address is removed and
+an exact applied setting is restored. Duplicate or conflicting rows and
+unexpected setting values fail closed without broad cleanup. A normal
+journal-write failure rolls back from authoritative in-memory state and reports
+rollback failure preferentially.
 
 Wintun 0.14.1 has no independent delete API for an adapter reopened after its
-creating process is gone. When a journal has no external-interface routes,
-independent recovery drops its verified opened handle and polls alias and LUID
-every 50 ms for at most five seconds. If either identity remains, the helper
-keeps the journal and returns `RecoveryRequired` instead of claiming complete
-cleanup. A journal with an external-interface route is already retained and
-reported as `RecoveryRequired` after adapter-owned restoration; the helper
-does not mutate that route or clear the journal.
+creating process is gone. Independent recovery drops its verified opened
+handle and polls the complete alias/LUID/GUID/ifIndex generation every 50 ms
+for at most five seconds. Any residual or reused selector keeps the journal and
+returns `RecoveryRequired`. If the complete generation is already absent,
+recovery proves all four selectors absent again before authorizing idempotent
+journal clearing.
 
 ## Split-default capture routes
 
@@ -424,8 +495,9 @@ slice. The centrally defined built-in global DIRECT exclusions are:
 ```
 
 Explicit `tun.management_exclusions` are added to the same global exclusion
-set. They must be host CIDRs (`/32` or `/128`), are written to the recovery
-plan, and use the discovered physical gateway.
+set. They must be host CIDRs (`/32` or `/128`) and identify operator-owned
+physical `ActiveStore` routes that startup validates. They are deliberately
+absent from `route_specs` and `RecoveryPlan`.
 
 Confirmed local-network system-proxy endpoints are a distinct mandatory
 user-space-router exception. One worker performs read-only WinHTTP/WinINet
@@ -477,9 +549,9 @@ The exclusion vocabulary in `tun/routes.rs` is auditable:
 - `direct_dns`;
 - `proxy_server_future`.
 
-The current runtime installs only explicitly configured management exclusions.
-It does not silently exempt LAN ranges, DNS servers, arbitrary destinations, or
-a not-yet-implemented proxy server.
+The current runtime validates only explicitly configured management
+exclusions; it never installs them. It does not silently exempt LAN ranges,
+DNS servers, arbitrary destinations, or a not-yet-implemented proxy server.
 
 ## Packet and protocol limits
 
@@ -603,17 +675,20 @@ cannot delete an adapter through a newly reopened handle.
 
 ### Real Windows
 
-Real acceptance must use media downloaded from a successful Actions run after
-compilation, tests, Wintun smoke, hash/signature checks, and packaging. The
-workflow definition stages and uploads that media with `BUILD-INFO` and
+Real acceptance must use the media from the newly selected successful Actions
+run only after Task 10 verifies compilation/test gates, Wintun smoke,
+hash/signature checks, exact artifact inventory, and packaging. Old artifacts,
+hashes, route observations, and acceptance evidence cannot be reused. The
+workflow definition stages and uploads media with `BUILD-INFO` and
 `SHA256SUMS`, but no artifact exists until a particular run completes
 successfully. First perform only read-only host inspection in Microsoft Remote
 Desktop. Running even the isolated smoke mutates a temporary adapter and two
-routes, so it requires the agreed action-time confirmation.
+routes, so it requires fresh action-time confirmation.
 
-Full capture additionally requires an out-of-band console, RDP peer exclusion,
-saved snapshots, an automatic rollback watchdog, and the standalone recovery
-binary. Evidence and procedure are defined in
+Full capture additionally requires an out-of-band console, a freshly verified
+operator-owned exact `/32` or `/128` physical `ActiveStore` route for the RDP
+peer, saved snapshots, an automatic rollback watchdog, and the standalone
+recovery binary. Evidence and procedure are defined in
 [WINDOWS_RECOVERY.md](WINDOWS_RECOVERY.md) and
 [WINDOWS_ACCEPTANCE_TEMPLATE.md](WINDOWS_ACCEPTANCE_TEMPLATE.md).
 

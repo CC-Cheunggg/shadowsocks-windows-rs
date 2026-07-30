@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
+    "test:windows-artifact": "node --test scripts/stage-windows-artifact.test.mjs",
+    "verify:windows-bundle-config": "node scripts/verify-windows-bundle-config.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

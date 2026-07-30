@@ -19,7 +19,7 @@ mod windows_smoke {
         InterfaceAddress, InterfaceIdentity, OwnedRoute, RouteTransaction, SystemNetworkSnapshot,
         find_interface_by_alias, resolve_interface_identity, restore_isolated,
     };
-    use shadowsocks_windows_rs_lib::tun::wintun::{MIN_RING_CAPACITY, Session, Wintun};
+    use shadowsocks_windows_rs_lib::tun::wintun::{Adapter, MIN_RING_CAPACITY, Session, Wintun};
     use std::error::Error;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
     use std::sync::mpsc;
@@ -59,12 +59,14 @@ mod windows_smoke {
         println!("Created temporary adapter {adapter_name} (ifIndex {interface_index})");
         let session = adapter.start_session(MIN_RING_CAPACITY)?;
 
-        let mut network = IsolatedNetwork::install(interface)?;
+        let mut network = IsolatedNetwork::new();
+        if let Err(error) = network.install(interface) {
+            cleanup_network(network, session, adapter)?;
+            return Err(error);
+        }
         let smoke_result = run_packet_checks(&session);
 
-        network.cleanup()?;
-        drop(session);
-        adapter.remove_owned()?;
+        cleanup_network(network, session, adapter)?;
 
         let snapshot_after = SystemNetworkSnapshot::capture()?;
         let defaults_after = snapshot_after.default_route_fingerprint()?;
@@ -289,23 +291,71 @@ mod windows_smoke {
     }
 
     impl IsolatedNetwork {
-        fn install(interface: InterfaceIdentity) -> SmokeResult<Self> {
+        fn new() -> Self {
+            Self { transaction: None }
+        }
+
+        fn install(&mut self, interface: InterfaceIdentity) -> SmokeResult<()> {
             let transaction = RouteTransaction::install_isolated(
                 interface.clone(),
                 vec![isolated_address()],
                 isolated_routes(&interface)?,
+                &mut self.transaction,
             )?;
-            Ok(Self {
-                transaction: Some(transaction),
-            })
+            self.transaction = Some(transaction);
+            Ok(())
         }
 
-        fn cleanup(&mut self) -> SmokeResult<()> {
-            if let Some(transaction) = self.transaction.take() {
-                transaction.restore()?;
+        fn withdraw_capture_routes(&mut self) -> SmokeResult<()> {
+            if let Some(transaction) = self.transaction.as_mut() {
+                transaction.withdraw_capture_routes()?;
             }
             Ok(())
         }
+
+        fn restore_interface_state_after_session(&mut self) -> SmokeResult<()> {
+            if let Some(transaction) = self.transaction.as_mut() {
+                transaction.restore_interface_state_after_session()?;
+            }
+            Ok(())
+        }
+
+        fn finish_ordered_cleanup(&mut self) -> SmokeResult<()> {
+            if let Some(transaction) = self.transaction.take() {
+                transaction.finish_ordered_cleanup()?;
+            }
+            Ok(())
+        }
+    }
+
+    fn cleanup_network(
+        mut network: IsolatedNetwork,
+        session: Session,
+        adapter: Adapter,
+    ) -> SmokeResult<()> {
+        if let Err(error) = network.withdraw_capture_routes() {
+            // Do not let unwinding end the session or remove the adapter after
+            // route withdrawal failed. Retain every downstream resource for
+            // the rest of this process, matching the production fallback.
+            std::mem::forget(network);
+            std::mem::forget(session);
+            std::mem::forget(adapter);
+            return Err(error);
+        }
+
+        drop(session);
+
+        if let Err(error) = network.restore_interface_state_after_session() {
+            // The session has ended, but adapter removal could implicitly
+            // discard interface state that was not restored successfully.
+            std::mem::forget(network);
+            std::mem::forget(adapter);
+            return Err(error);
+        }
+
+        network.finish_ordered_cleanup()?;
+        adapter.remove_owned()?;
+        Ok(())
     }
 
     fn isolated_address() -> InterfaceAddress {

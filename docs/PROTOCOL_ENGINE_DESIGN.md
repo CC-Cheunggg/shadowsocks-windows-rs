@@ -6,6 +6,8 @@ Shadowsocks framing, encryption, or the PROXY outbound exists.
 
 For the concrete DIRECT implementation and support matrix, see
 [WINTUN_DIRECT_ARCHITECTURE.md](WINTUN_DIRECT_ARCHITECTURE.md).
+The normative ownership and safety requirements are in
+[DEVELOPMENT_CONSTRAINTS.md](DEVELOPMENT_CONSTRAINTS.md) and take precedence.
 All Windows implementation work is also governed by the normative
 [Windows native API policy](WINDOWS_NATIVE_API_POLICY.md): when a documented
 Win32/WinSock/IP Helper API exists, compiled code must not replace it by
@@ -107,9 +109,13 @@ The current built-in global DIRECT exclusions are centralized as:
 ::1/128
 ```
 
-Explicit management peers may be added as host CIDRs (`/32` or `/128`) and
-become both route-plan and global-router exclusions. This supports a protected
-RDP/control path during approved testing.
+Explicit management peers may be added as host CIDRs (`/32` or `/128`). They
+become global-router DIRECT exclusions and read-only route-plan
+preconditions—not application-owned routes. During approved real-machine
+testing, the operator must separately create and own the exact physical
+`ActiveStore` host route. The application validates its physical
+ifIndex/LUID/gateway/family and winning best-route selection but never creates,
+updates, journals, or removes it.
 
 Read-only WinHTTP/WinINet state identifies manual, protocol-specific, and
 WinHTTP-default named-proxy endpoints and detects AutoConfig/PAC presence.
@@ -158,15 +164,19 @@ The exclusion-reason vocabulary is centralized:
 - confirmed local-network system proxy;
 - future proxy server.
 
-The current runtime installs only explicit management exclusions. It does not
-silently exempt arbitrary LAN ranges, DNS servers, destinations, or a future
-proxy server. Before a real full-capture test, the current RDP peer must be an
-explicit host exclusion and an automatic rollback watchdog must be active.
+The current runtime validates only explicitly configured management
+exclusions; the configuration may be empty, so the real-machine runbook
+requires the operator to identify the current RDP peer and configure its host
+CIDR. It does not silently exempt arbitrary LAN ranges, DNS servers,
+destinations, or a future proxy server. Before a real full-capture test, the
+current peer must have the matching operator-owned host route and an automatic
+rollback watchdog must be active.
 
 When PROXY is implemented, the selected Shadowsocks server endpoint will need
 an explicit physical-interface exclusion/binding so its transport cannot be
 captured recursively. That exclusion must be resolved, bounded, audited, and
-restored like current management exclusions.
+given its own explicit ownership/lifecycle design; the operator-owned
+management route is not precedent for application ownership.
 
 ## Module and dependency direction
 
@@ -200,6 +210,40 @@ The concerns remain separate:
   decryption, and authentication without knowing about Wintun.
 
 Routing always occurs before the future encryption boundary.
+
+## Future per-process DIRECT rule requirement
+
+The rule engine must support selecting one Windows executable for DIRECT
+routing. This is a post-capture routing exception, not a capture exclusion:
+matching TCP and UDP traffic still enters Wintun and traverses packet parsing,
+session/association handling, and the router before the replacement DIRECT
+socket binds the original physical interface.
+
+The intended matcher is an explicit normalized full executable path (for
+example, `C:\Program Files\Example\example.exe`), not a destination-based
+approximation. On the first packet of a new flow, the Windows runtime must
+resolve the owning process from the protocol and local endpoint, obtain the
+process's full executable path through native Windows APIs, and add that
+identity to the routing context. Matching remains part of the existing ordered
+first-match rule model, with `DIRECT` as the required action for this initial
+feature.
+
+Implementation requirements:
+
+- support both TCP and UDP, documenting any Windows endpoint-ownership
+  ambiguity;
+- compare normalized Windows paths case-insensitively;
+- key any bounded cache by a process identity that detects PID reuse, rather
+  than trusting a PID alone;
+- use native Windows APIs and do not spawn command-line inspection tools;
+- do not log executable paths in ordinary diagnostics; and
+- if ownership or path resolution fails, do not grant DIRECT implicitly:
+  continue evaluating the remaining destination rules and the configured
+  default action.
+
+This requirement does not introduce WFP, a callout driver, or a guarantee that
+the selected executable's packets avoid Wintun entirely. A true pre-capture
+per-process exclusion is outside this requirement.
 
 ## Current TCP-stack decision
 
@@ -351,15 +395,18 @@ commit, and artifact identity are added to the acceptance evidence.
 
 Full DIRECT acceptance must use a successful Actions-built artifact in the
 real Windows environment. It requires pre/post network snapshots, RDP
-exclusion, an out-of-band console, a rollback watchdog, packet captures,
-counters, three start/stop cycles, and verified recovery. See
+peer configuration plus its operator-owned physical host route, an out-of-band
+console, a rollback watchdog, packet captures, counters, three start/stop
+cycles, and verified recovery. See
 [WINDOWS_RECOVERY.md](WINDOWS_RECOVERY.md).
 
 The `/1` capture routes are supplemented with snapshot-derived child prefixes.
 An existing `/32` or `/128` collision is accepted only when the effective
 Wintun route plus interface metric is proven to outrank it; management host
-exceptions remain physical by design. Formal proof that this behaves as
-intended on the acceptance machine still belongs in the real-Windows evidence.
+exceptions remain operator-owned and physical by design, are omitted from the
+application recovery plan, and are validated read-only. Formal proof that this
+behaves as intended on the acceptance machine still belongs in the
+real-Windows evidence.
 
 No statement in this document should be read as evidence that real Windows
 acceptance has passed unless a completed acceptance record is linked.

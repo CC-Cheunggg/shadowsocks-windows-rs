@@ -2,7 +2,15 @@
   "bundle": {
     "resources": {
       "resources/wintun/amd64/wintun.dll": "wintun.dll",
+      "../LICENSE": "LICENSE.txt",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
       "../third_party/wintun/LICENSE.txt": "WINTUN-LICENSE.txt"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
     }
   }
 }
