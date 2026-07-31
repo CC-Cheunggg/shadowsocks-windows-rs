@@ -32,6 +32,10 @@ fn runtime_version_is_present(value: Option<&str>) -> bool {
     !value.is_empty() && value != "0.0.0.0"
 }
 
+fn registry_string_byte_length_is_valid(byte_len: usize, buffer_capacity: usize) -> bool {
+    byte_len > 0 && byte_len <= buffer_capacity && byte_len % std::mem::size_of::<u16>() == 0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DownloadTimeouts {
     resolve: Duration,
@@ -159,8 +163,9 @@ impl RedirectPolicy {
 
         let next = current
             .join(location)
-            .map_err(|_| BootstrapError::DownloadUrl)?;
-        self.validate(&next)?;
+            .map_err(|_| BootstrapError::DownloadUrl.at_stage(BootstrapStage::HttpRedirect))?;
+        self.validate(&next)
+            .map_err(|error| error.at_stage(BootstrapStage::HttpRedirect))?;
         Ok(next)
     }
 
@@ -199,7 +204,7 @@ enum SignatureEvidence {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BootstrapError {
+enum BootstrapErrorKind {
     RuntimeDetection,
     MutexAcquire,
     MutexRelease,
@@ -220,7 +225,30 @@ enum BootstrapError {
     Cleanup,
 }
 
-impl BootstrapError {
+impl BootstrapErrorKind {
+    fn id(self) -> &'static str {
+        match self {
+            Self::RuntimeDetection => "runtime_detection",
+            Self::MutexAcquire => "mutex_acquire",
+            Self::MutexRelease => "mutex_release",
+            Self::ProgressWindow => "progress_window",
+            Self::DownloadUrl => "download_url",
+            Self::RedirectDomain => "redirect_domain",
+            Self::TooManyRedirects => "too_many_redirects",
+            Self::DownloadTooLarge => "download_too_large",
+            Self::DownloadTimeout => "download_timeout",
+            Self::DownloadFailed => "download_failed",
+            Self::TemporaryFile => "temporary_file",
+            Self::SignatureInspection => "signature_inspection",
+            Self::SignatureRejected => "signature_rejected",
+            Self::InstallerLaunch => "installer_launch",
+            Self::InstallerTimeout => "installer_timeout",
+            Self::InstallerFailed => "installer_failed",
+            Self::RuntimeStillMissing => "runtime_still_missing",
+            Self::Cleanup => "cleanup",
+        }
+    }
+
     fn user_message(self) -> &'static str {
         match self {
             Self::DownloadUrl
@@ -248,6 +276,275 @@ impl BootstrapError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootstrapStage {
+    RuntimeInitialDetection,
+    RuntimeLockedDetection,
+    RuntimeRedetection,
+    MutexCreate,
+    MutexWait,
+    MutexRelease,
+    ProgressOpen,
+    ProgressMessageLoop,
+    ProgressClose,
+    DownloadPolicy,
+    WinHttpSession,
+    WinHttpConnect,
+    WinHttpRequestOpen,
+    WinHttpRequestSend,
+    WinHttpResponseReceive,
+    HttpStatus,
+    HttpRedirect,
+    DownloadRead,
+    TemporaryFileCreate,
+    TemporaryFileWrite,
+    TemporaryFileFlush,
+    TemporaryFileLock,
+    AuthenticodeVerify,
+    AuthenticodeSigner,
+    AuthenticodeClose,
+    InstallerJobCreate,
+    InstallerJobConfigure,
+    InstallerCreateProcess,
+    InstallerAssignJob,
+    InstallerResume,
+    InstallerWait,
+    InstallerExit,
+    InstallerJobDrain,
+    InstallerTerminate,
+    TemporaryFileCleanup,
+}
+
+impl BootstrapStage {
+    fn id(self) -> &'static str {
+        match self {
+            Self::RuntimeInitialDetection => "runtime.initial_detection",
+            Self::RuntimeLockedDetection => "runtime.locked_detection",
+            Self::RuntimeRedetection => "runtime.redetection",
+            Self::MutexCreate => "mutex.create",
+            Self::MutexWait => "mutex.wait",
+            Self::MutexRelease => "mutex.release",
+            Self::ProgressOpen => "progress.open",
+            Self::ProgressMessageLoop => "progress.message_loop",
+            Self::ProgressClose => "progress.close",
+            Self::DownloadPolicy => "download.policy",
+            Self::WinHttpSession => "winhttp.session",
+            Self::WinHttpConnect => "winhttp.connect",
+            Self::WinHttpRequestOpen => "winhttp.request_open",
+            Self::WinHttpRequestSend => "winhttp.request_send",
+            Self::WinHttpResponseReceive => "winhttp.response_receive",
+            Self::HttpStatus => "http.status",
+            Self::HttpRedirect => "http.redirect",
+            Self::DownloadRead => "download.read",
+            Self::TemporaryFileCreate => "temporary_file.create",
+            Self::TemporaryFileWrite => "temporary_file.write",
+            Self::TemporaryFileFlush => "temporary_file.flush",
+            Self::TemporaryFileLock => "temporary_file.lock",
+            Self::AuthenticodeVerify => "authenticode.verify",
+            Self::AuthenticodeSigner => "authenticode.signer",
+            Self::AuthenticodeClose => "authenticode.close",
+            Self::InstallerJobCreate => "installer.job_create",
+            Self::InstallerJobConfigure => "installer.job_configure",
+            Self::InstallerCreateProcess => "installer.create_process",
+            Self::InstallerAssignJob => "installer.assign_job",
+            Self::InstallerResume => "installer.resume",
+            Self::InstallerWait => "installer.wait",
+            Self::InstallerExit => "installer.exit",
+            Self::InstallerJobDrain => "installer.job_drain",
+            Self::InstallerTerminate => "installer.terminate",
+            Self::TemporaryFileCleanup => "temporary_file.cleanup",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootstrapSystemCode {
+    Win32(u32),
+    WinHttp(u32),
+    HttpStatus(u32),
+    WinTrust(i32),
+    HResult(i32),
+    InstallerExit(u32),
+    WaitStatus(u32),
+}
+
+impl BootstrapSystemCode {
+    fn render(self) -> String {
+        match self {
+            Self::Win32(code) => format!("win32:{code} (0x{code:08X})"),
+            Self::WinHttp(code) => format!("winhttp:{code} (0x{code:08X})"),
+            Self::HttpStatus(code) => format!("http_status:{code}"),
+            Self::WinTrust(code) => format!("wintrust:0x{:08X}", code as u32),
+            Self::HResult(code) => format!("hresult:0x{:08X}", code as u32),
+            Self::InstallerExit(code) => format!("installer_exit:{code} (0x{code:08X})"),
+            Self::WaitStatus(code) => format!("wait_status:{code} (0x{code:08X})"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BootstrapDiagnostic {
+    kind: BootstrapErrorKind,
+    stage: BootstrapStage,
+    system_code: Option<BootstrapSystemCode>,
+}
+
+impl BootstrapDiagnostic {
+    const fn new(kind: BootstrapErrorKind, stage: BootstrapStage) -> Self {
+        Self {
+            kind,
+            stage,
+            system_code: None,
+        }
+    }
+
+    fn line(self, label: &str) -> String {
+        let mut line = format!(
+            "{label}: stage={}; category={}",
+            self.stage.id(),
+            self.kind.id()
+        );
+        if let Some(code) = self.system_code {
+            line.push_str("; code=");
+            line.push_str(&code.render());
+        }
+        line
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BootstrapError {
+    primary: BootstrapDiagnostic,
+    secondary: Option<BootstrapDiagnostic>,
+}
+
+#[allow(non_upper_case_globals)]
+impl BootstrapError {
+    const RuntimeDetection: Self = Self::new(
+        BootstrapErrorKind::RuntimeDetection,
+        BootstrapStage::RuntimeInitialDetection,
+    );
+    const MutexAcquire: Self =
+        Self::new(BootstrapErrorKind::MutexAcquire, BootstrapStage::MutexWait);
+    const MutexRelease: Self = Self::new(
+        BootstrapErrorKind::MutexRelease,
+        BootstrapStage::MutexRelease,
+    );
+    const ProgressWindow: Self = Self::new(
+        BootstrapErrorKind::ProgressWindow,
+        BootstrapStage::ProgressOpen,
+    );
+    const DownloadUrl: Self = Self::new(
+        BootstrapErrorKind::DownloadUrl,
+        BootstrapStage::DownloadPolicy,
+    );
+    const RedirectDomain: Self = Self::new(
+        BootstrapErrorKind::RedirectDomain,
+        BootstrapStage::HttpRedirect,
+    );
+    const TooManyRedirects: Self = Self::new(
+        BootstrapErrorKind::TooManyRedirects,
+        BootstrapStage::HttpRedirect,
+    );
+    const DownloadTooLarge: Self = Self::new(
+        BootstrapErrorKind::DownloadTooLarge,
+        BootstrapStage::DownloadRead,
+    );
+    const DownloadTimeout: Self = Self::new(
+        BootstrapErrorKind::DownloadTimeout,
+        BootstrapStage::DownloadRead,
+    );
+    const DownloadFailed: Self = Self::new(
+        BootstrapErrorKind::DownloadFailed,
+        BootstrapStage::DownloadRead,
+    );
+    const TemporaryFile: Self = Self::new(
+        BootstrapErrorKind::TemporaryFile,
+        BootstrapStage::TemporaryFileCreate,
+    );
+    const SignatureInspection: Self = Self::new(
+        BootstrapErrorKind::SignatureInspection,
+        BootstrapStage::AuthenticodeVerify,
+    );
+    const SignatureRejected: Self = Self::new(
+        BootstrapErrorKind::SignatureRejected,
+        BootstrapStage::AuthenticodeSigner,
+    );
+    const InstallerLaunch: Self = Self::new(
+        BootstrapErrorKind::InstallerLaunch,
+        BootstrapStage::InstallerCreateProcess,
+    );
+    const InstallerTimeout: Self = Self::new(
+        BootstrapErrorKind::InstallerTimeout,
+        BootstrapStage::InstallerWait,
+    );
+    const InstallerFailed: Self = Self::new(
+        BootstrapErrorKind::InstallerFailed,
+        BootstrapStage::InstallerExit,
+    );
+    const RuntimeStillMissing: Self = Self::new(
+        BootstrapErrorKind::RuntimeStillMissing,
+        BootstrapStage::RuntimeRedetection,
+    );
+    const Cleanup: Self = Self::new(
+        BootstrapErrorKind::Cleanup,
+        BootstrapStage::TemporaryFileCleanup,
+    );
+
+    const fn new(kind: BootstrapErrorKind, stage: BootstrapStage) -> Self {
+        Self {
+            primary: BootstrapDiagnostic::new(kind, stage),
+            secondary: None,
+        }
+    }
+
+    fn at_stage(mut self, stage: BootstrapStage) -> Self {
+        self.primary.stage = stage;
+        self
+    }
+
+    fn with_system_code(mut self, system_code: BootstrapSystemCode) -> Self {
+        self.primary.system_code = Some(system_code);
+        self
+    }
+
+    fn with_secondary(mut self, secondary: Self) -> Self {
+        if self.secondary.is_none() {
+            self.secondary = Some(secondary.primary);
+        }
+        self
+    }
+
+    fn kind(self) -> BootstrapErrorKind {
+        self.primary.kind
+    }
+
+    fn stage(self) -> BootstrapStage {
+        self.primary.stage
+    }
+
+    fn system_code(self) -> Option<BootstrapSystemCode> {
+        self.primary.system_code
+    }
+
+    fn user_message(self) -> &'static str {
+        self.primary.kind.user_message()
+    }
+
+    fn report_message(self) -> String {
+        let mut message = format!(
+            "{}\n\n{}",
+            self.user_message(),
+            self.primary.line("diagnostic")
+        );
+        if let Some(secondary) = self.secondary {
+            message.push('\n');
+            message.push_str(&secondary.line("secondary"));
+        }
+        message
+    }
+}
+
 trait RuntimeDetector {
     fn is_installed(&mut self) -> Result<bool, BootstrapError>;
 }
@@ -265,7 +562,7 @@ trait BootstrapMutex {
 trait ProgressUi {
     fn open(&mut self) -> Result<(), BootstrapError>;
     fn close(&mut self) -> Result<(), BootstrapError>;
-    fn show_error(&mut self, message: &'static str) -> Result<(), BootstrapError>;
+    fn show_error(&mut self, message: &str) -> Result<(), BootstrapError>;
 }
 
 trait InstallerArtifact {
@@ -321,7 +618,11 @@ fn initialize_under_progress(
                 if organization == MICROSOFT_SIGNER_ORGANIZATION => {}
             SignatureEvidence::Trusted { .. }
             | SignatureEvidence::Unsigned
-            | SignatureEvidence::Invalid => return Err(BootstrapError::SignatureRejected),
+            | SignatureEvidence::Invalid => {
+                return Err(
+                    BootstrapError::SignatureRejected.at_stage(BootstrapStage::AuthenticodeSigner)
+                );
+            }
         }
 
         let install_started = components.clock.now();
@@ -329,11 +630,16 @@ fn initialize_under_progress(
             .installer
             .install(artifact.as_ref(), InstallPolicy::FIXED)?;
         if exit_code != SUCCESS_EXIT_CODE {
-            return Err(BootstrapError::InstallerFailed);
+            return Err(BootstrapError::InstallerFailed
+                .with_system_code(BootstrapSystemCode::InstallerExit(exit_code)));
         }
 
         loop {
-            if components.detector.is_installed()? {
+            if components
+                .detector
+                .is_installed()
+                .map_err(|error| error.at_stage(BootstrapStage::RuntimeRedetection))?
+            {
                 break;
             }
             let elapsed = components.clock.now().saturating_sub(install_started);
@@ -350,15 +656,19 @@ fn initialize_under_progress(
 
     let cleanup = artifact.cleanup();
     match (initialization, cleanup) {
-        (Err(_), Err(_)) => Err(BootstrapError::Cleanup),
+        (Err(error), Err(cleanup_error)) => Err(error.with_secondary(cleanup_error)),
         (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(_)) => Err(BootstrapError::Cleanup),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
 
 fn initialize_while_locked(components: &mut BootstrapComponents<'_>) -> Result<(), BootstrapError> {
-    if components.detector.is_installed()? {
+    if components
+        .detector
+        .is_installed()
+        .map_err(|error| error.at_stage(BootstrapStage::RuntimeLockedDetection))?
+    {
         return Ok(());
     }
 
@@ -366,14 +676,19 @@ fn initialize_while_locked(components: &mut BootstrapComponents<'_>) -> Result<(
     let initialization = initialize_under_progress(components);
     let close = components.ui.close();
     match (initialization, close) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(_)) => Err(BootstrapError::ProgressWindow),
+        (Err(error), Err(close_error)) => Err(error.with_secondary(close_error)),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(close_error)) => Err(close_error),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
 
 fn bootstrap(components: &mut BootstrapComponents<'_>) -> Result<(), BootstrapError> {
-    if components.detector.is_installed()? {
+    if components
+        .detector
+        .is_installed()
+        .map_err(|error| error.at_stage(BootstrapStage::RuntimeInitialDetection))?
+    {
         return Ok(());
     }
 
@@ -381,8 +696,9 @@ fn bootstrap(components: &mut BootstrapComponents<'_>) -> Result<(), BootstrapEr
     let initialization = initialize_while_locked(components);
     let release = components.mutex.release();
     match (initialization, release) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(_)) => Err(BootstrapError::MutexRelease),
+        (Err(error), Err(release_error)) => Err(error.with_secondary(release_error)),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(release_error)) => Err(release_error),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
@@ -392,7 +708,8 @@ fn bootstrap_and_report(components: &mut BootstrapComponents<'_>) -> Result<(), 
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = components.ui.close();
-            let _ = components.ui.show_error(error.user_message());
+            let message = error.report_message();
+            let _ = components.ui.show_error(&message);
             Err(error)
         }
     }
@@ -438,6 +755,7 @@ mod tests {
         cleaned: bool,
         fixed_download_policy_seen: bool,
         fixed_install_policy_seen: bool,
+        error_message: Option<String>,
     }
 
     impl Default for FakeState {
@@ -459,6 +777,7 @@ mod tests {
                 cleaned: false,
                 fixed_download_policy_seen: false,
                 fixed_install_policy_seen: false,
+                error_message: None,
             }
         }
     }
@@ -557,9 +876,11 @@ mod tests {
             Ok(())
         }
 
-        fn show_error(&mut self, message: &'static str) -> Result<(), BootstrapError> {
+        fn show_error(&mut self, message: &str) -> Result<(), BootstrapError> {
             assert!(!message.is_empty());
-            self.0.0.borrow_mut().calls.push("error_dialog");
+            let mut state = self.0.0.borrow_mut();
+            state.calls.push("error_dialog");
+            state.error_message = Some(message.to_owned());
             Ok(())
         }
     }
@@ -772,7 +1093,7 @@ mod tests {
             Ok(())
         }
 
-        fn show_error(&mut self, _message: &'static str) -> Result<(), BootstrapError> {
+        fn show_error(&mut self, _message: &str) -> Result<(), BootstrapError> {
             Ok(())
         }
     }
@@ -959,7 +1280,7 @@ mod tests {
                 "https://user@msedge.sf.dl.delivery.mp.microsoft.com/setup.exe",
                 0,
             ),
-            Err(BootstrapError::DownloadUrl)
+            Err(BootstrapError::DownloadUrl.at_stage(BootstrapStage::HttpRedirect))
         );
         assert_eq!(
             policy.follow(
@@ -967,7 +1288,7 @@ mod tests {
                 "https://msedge.sf.dl.delivery.mp.microsoft.com:444/setup.exe",
                 0,
             ),
-            Err(BootstrapError::DownloadUrl)
+            Err(BootstrapError::DownloadUrl.at_stage(BootstrapStage::HttpRedirect))
         );
     }
 
@@ -1111,7 +1432,13 @@ mod tests {
         let mut harness = Harness::new([Ok(false), Ok(false)]);
         harness.shared.0.borrow_mut().install = Ok(3010);
 
-        assert_eq!(harness.run(), Err(BootstrapError::InstallerFailed));
+        let error = harness.run().expect_err("installer exit must fail");
+        assert_eq!(error.kind(), BootstrapErrorKind::InstallerFailed);
+        assert_eq!(error.stage(), BootstrapStage::InstallerExit);
+        assert_eq!(
+            error.system_code(),
+            Some(BootstrapSystemCode::InstallerExit(3010))
+        );
         assert_eq!(
             harness.calls(),
             [
@@ -1128,6 +1455,18 @@ mod tests {
                 "error_dialog"
             ]
         );
+        let message = harness
+            .shared
+            .0
+            .borrow()
+            .error_message
+            .clone()
+            .expect("native diagnostic message");
+        assert!(message.contains("stage=installer.exit"));
+        assert!(message.contains("category=installer_failed"));
+        assert!(message.contains("code=installer_exit:3010 (0x00000BC2)"));
+        assert!(!message.contains(OFFICIAL_BOOTSTRAPPER_URL));
+        assert!(!message.contains("fake-webview2-bootstrapper.exe"));
     }
 
     #[test]
@@ -1225,11 +1564,136 @@ mod tests {
     }
 
     #[test]
+    fn operation_failure_keeps_primary_when_cleanup_also_fails() {
+        let mut harness = Harness::new([Ok(false), Ok(false)]);
+        {
+            let mut state = harness.shared.0.borrow_mut();
+            state.install = Err(BootstrapError::InstallerLaunch
+                .at_stage(BootstrapStage::InstallerCreateProcess)
+                .with_system_code(BootstrapSystemCode::Win32(32)));
+            state.cleanup =
+                Err(BootstrapError::Cleanup.with_system_code(BootstrapSystemCode::Win32(5)));
+        }
+
+        let error = harness.run().expect_err("operation and cleanup must fail");
+        assert_eq!(error.kind(), BootstrapErrorKind::InstallerLaunch);
+        assert_eq!(error.stage(), BootstrapStage::InstallerCreateProcess);
+        assert_eq!(error.system_code(), Some(BootstrapSystemCode::Win32(32)));
+        assert_eq!(
+            error.secondary,
+            Some(BootstrapDiagnostic {
+                kind: BootstrapErrorKind::Cleanup,
+                stage: BootstrapStage::TemporaryFileCleanup,
+                system_code: Some(BootstrapSystemCode::Win32(5)),
+            })
+        );
+        let message = harness
+            .shared
+            .0
+            .borrow()
+            .error_message
+            .clone()
+            .expect("native diagnostic message");
+        assert!(message.contains(
+            "diagnostic: stage=installer.create_process; category=installer_launch; \
+             code=win32:32 (0x00000020)"
+        ));
+        assert!(message.contains(
+            "secondary: stage=temporary_file.cleanup; category=cleanup; \
+             code=win32:5 (0x00000005)"
+        ));
+    }
+
+    #[test]
     fn detector_failure_shows_native_error_boundary_without_progress() {
         let mut harness = Harness::new([Err(BootstrapError::RuntimeDetection)]);
 
-        assert_eq!(harness.run(), Err(BootstrapError::RuntimeDetection));
+        let error = harness.run().expect_err("initial detection must fail");
+        assert_eq!(error.kind(), BootstrapErrorKind::RuntimeDetection);
+        assert_eq!(error.stage(), BootstrapStage::RuntimeInitialDetection);
         assert_eq!(harness.calls(), ["detect", "error_dialog"]);
+    }
+
+    #[test]
+    fn detector_failures_identify_locked_and_post_install_phases() {
+        let mut locked = Harness::new([
+            Ok(false),
+            Err(BootstrapError::RuntimeDetection.with_system_code(BootstrapSystemCode::Win32(5))),
+        ]);
+        let locked_error = locked.run().expect_err("locked detection must fail");
+        assert_eq!(locked_error.stage(), BootstrapStage::RuntimeLockedDetection);
+        assert_eq!(
+            locked_error.system_code(),
+            Some(BootstrapSystemCode::Win32(5))
+        );
+
+        let mut post_install = Harness::new([
+            Ok(false),
+            Ok(false),
+            Err(BootstrapError::RuntimeDetection.with_system_code(BootstrapSystemCode::Win32(2))),
+        ]);
+        let post_install_error = post_install
+            .run()
+            .expect_err("post-install detection must fail");
+        assert_eq!(
+            post_install_error.stage(),
+            BootstrapStage::RuntimeRedetection
+        );
+        assert_eq!(
+            post_install_error.system_code(),
+            Some(BootstrapSystemCode::Win32(2))
+        );
+    }
+
+    #[test]
+    fn diagnostic_codes_have_stable_bounded_rendering() {
+        let cases = [
+            (
+                BootstrapError::DownloadFailed
+                    .at_stage(BootstrapStage::WinHttpConnect)
+                    .with_system_code(BootstrapSystemCode::WinHttp(12_002)),
+                "code=winhttp:12002 (0x00002EE2)",
+            ),
+            (
+                BootstrapError::DownloadFailed
+                    .at_stage(BootstrapStage::HttpStatus)
+                    .with_system_code(BootstrapSystemCode::HttpStatus(503)),
+                "code=http_status:503",
+            ),
+            (
+                BootstrapError::SignatureRejected
+                    .at_stage(BootstrapStage::AuthenticodeVerify)
+                    .with_system_code(BootstrapSystemCode::WinTrust(0x800B0109u32 as i32)),
+                "code=wintrust:0x800B0109",
+            ),
+            (
+                BootstrapError::TemporaryFile
+                    .at_stage(BootstrapStage::TemporaryFileCreate)
+                    .with_system_code(BootstrapSystemCode::HResult(0x80004005u32 as i32)),
+                "code=hresult:0x80004005",
+            ),
+            (
+                BootstrapError::InstallerLaunch
+                    .at_stage(BootstrapStage::InstallerWait)
+                    .with_system_code(BootstrapSystemCode::WaitStatus(0xFFFF_FFFF)),
+                "code=wait_status:4294967295 (0xFFFFFFFF)",
+            ),
+            (
+                BootstrapError::ProgressWindow
+                    .at_stage(BootstrapStage::ProgressMessageLoop)
+                    .with_system_code(BootstrapSystemCode::Win32(87)),
+                "diagnostic: stage=progress.message_loop; category=progress_window; \
+                 code=win32:87 (0x00000057)",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let message = error.report_message();
+            assert!(message.contains(expected));
+            assert!(!message.contains(OFFICIAL_BOOTSTRAPPER_URL));
+            assert!(!message.contains("fake-webview2-bootstrapper.exe"));
+            assert!(!message.contains(MICROSOFT_SIGNER_ORGANIZATION));
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1240,6 +1704,12 @@ mod tests {
 
     #[test]
     fn runtime_registry_version_requires_a_real_nonzero_pv() {
+        assert!(!registry_string_byte_length_is_valid(0, 512));
+        assert!(!registry_string_byte_length_is_valid(1, 512));
+        assert!(registry_string_byte_length_is_valid(2, 512));
+        assert!(registry_string_byte_length_is_valid(512, 512));
+        assert!(!registry_string_byte_length_is_valid(513, 512));
+        assert!(!registry_string_byte_length_is_valid(514, 512));
         assert!(!runtime_version_is_present(None));
         assert!(!runtime_version_is_present(Some("")));
         assert!(!runtime_version_is_present(Some("   ")));

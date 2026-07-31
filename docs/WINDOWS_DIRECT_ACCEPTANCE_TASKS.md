@@ -11,25 +11,38 @@ that document differ, the development constraints win.
 
 ## Current checkpoint
 
-- Checkpoint: 2026-07-30, Asia/Shanghai, immediately after Task 8's
-  documentation and full local-validation gate passed.
+- Checkpoint: 2026-07-31, Asia/Shanghai, immediately after Task 11-R1 stopped
+  at local root-cause analysis plus a minimal staged-diagnostic patch.
 - Branch: `codex/direct-wintun-slice`.
-- Last pushed commit: `ece125b3e4cfe1974c3947a89d9c626ab8b55fbf`.
-- No new commit or push was made after that commit.
-- No new GitHub Actions run was started.
+- Last pushed commit:
+  `85c87a7e216f8d2de346e77240a2cd53166bba46`.
+- Windows Actions run
+  [30553085622](https://github.com/CC-Cheunggg/shadowsocks-windows-rs/actions/runs/30553085622)
+  completed successfully for that exact head SHA.
 - No Windows adapter, address, route, DNS, firewall, or proxy mutation was
-  performed.
-- The existing read-only Windows baseline remains the latest remote evidence.
+  performed. Task 11's pre/post read-only snapshots are the latest remote
+  evidence.
 - `preview-overview.png` is still the user's unrelated staged deletion. It must
   not be restored, modified, or included in our commits.
-- The current worktree contains combined, uncommitted WIP from several tasks.
-  Treat every WIP change as unaccepted until its own task is reviewed and its
-  completion gate passes.
-- Tasks 6 and 7 are implementation-complete at their local gates. Their MSVC,
-  NSIS, artifact, and native Windows evidence remains explicitly deferred to
-  Tasks 9–11.
-- Task 8 is complete. Task 9 has not started; resume only after an explicit
-  instruction naming Task 9.
+- Task 9 through Task 11 records below are intentionally retained as local
+  uncommitted documentation changes so recording run/artifact evidence does
+  not create a new, unvalidated head SHA.
+- Task 10 passed. The exact original ZIP is retained read-only at
+  `/private/tmp/sswr-task10-30553085622-50reVT/sswr-windows-x86_64-msvc-30553085622-1.zip`.
+- Task 11 is `BLOCKED`: the exact raw EXE reached the missing-Runtime bootstrap,
+  then displayed `Shadowsocks 初始化失败` /
+  `运行环境安装失败。请重试；如仍失败，请联系管理员。`. The main Tauri
+  window did not appear, and the Runtime remained absent.
+- Task 11-R1 proved that the historical state machine reached
+  `SilentInstaller::install()`, but the old error model cannot distinguish the
+  first Job Object operation, `CreateProcessW`, later installer-control calls,
+  or a non-zero child exit. The underlying root cause remains unproved.
+- The local uncommitted diagnostic patch preserves exact stage/category and
+  typed numeric system or installer codes without changing bootstrap security
+  policy. It has not been built into a Windows artifact or retried.
+- Task 12 has not started and is prohibited until Task 11 passes. The next
+  permissible Task 11 action is one newly qualified diagnostic artifact and
+  one separately authorized missing-Runtime raw-EXE retry.
 
 ## Task 1 — Management route ownership and startup gate
 
@@ -615,7 +628,7 @@ Completion record:
 
 ## Task 9 — Bounded commit, push, and Windows Actions
 
-Status: `PENDING`
+Status: `COMPLETE — bounded commit, push, and Windows Actions passed`
 
 Scope:
 
@@ -631,9 +644,36 @@ Completion gate:
 - Push succeeds.
 - Windows Actions completes successfully.
 
+Completion record:
+
+- Created commit
+  `85c87a7e216f8d2de346e77240a2cd53166bba46`
+  (`feat: complete Windows DIRECT safety and packaging gates`) from 27 explicit
+  Task 1–8 paths and pushed it normally to
+  `codex/direct-wintun-slice`. No force push, merge, rebase, pull, PR, tag, or
+  release was performed.
+- The unrelated `preview-overview.png` deletion was excluded from the commit
+  and remains staged. Its staged diff object hash before and after the commit
+  was identical: `44d10b6724d936cbd87b2433a767f3f1180bc999`.
+- Windows workflow run
+  [30553085622](https://github.com/CC-Cheunggg/shadowsocks-windows-rs/actions/runs/30553085622)
+  was triggered by `push` at `2026-07-30T14:43:12Z`. Its head SHA was exactly
+  `85c87a7e216f8d2de346e77240a2cd53166bba46`; it completed at
+  `2026-07-30T14:54:02Z` with conclusion `success`.
+- No CI fix commit and no rerun were required.
+- The successful job built and tested the Windows/MSVC targets, built the three
+  release executables, created the optional NSIS setup, verified static CRT
+  linkage and PE subsystems 2/3/3, verified the pinned Wintun hashes and
+  Authenticode signer, ran the isolated Wintun ring smoke and cleanup/default
+  route comparison, staged the exact delivery inventory, generated
+  `BUILD-INFO` and `SHA256SUMS`, and reverified the staged signature and hashes.
+- The artifact upload step succeeded. The artifact contents, manifest, hashes,
+  signatures, and eligibility for a Windows machine have not been
+  independently verified; that remains exclusively Task 10.
+
 ## Task 10 — New artifact verification
 
-Status: `PENDING`
+Status: `COMPLETE — ELIGIBLE FOR TASK 11 READ-ONLY TRANSFER`
 
 Scope:
 
@@ -645,9 +685,126 @@ Completion gate:
 
 - Only a fully verified new artifact is eligible for the Windows machine.
 
+Completion record:
+
+- Unique source binding passed:
+  - repository `CC-Cheunggg/shadowsocks-windows-rs`;
+  - workflow `.github/workflows/windows.yml`;
+  - branch `codex/direct-wintun-slice`, event `push`;
+  - commit `85c87a7e216f8d2de346e77240a2cd53166bba46`;
+  - run
+    [30553085622](https://github.com/CC-Cheunggg/shadowsocks-windows-rs/actions/runs/30553085622),
+    attempt `1`, job `90906464758`, conclusion `success`;
+  - local `HEAD`, local remote-tracking ref, a fresh `git ls-remote` result,
+    workflow head SHA, and artifact workflow head SHA all matched that commit.
+  The artifact upload step succeeded and no rerun was performed.
+- The run exposed exactly one artifact and it exactly matched the expected
+  name: artifact ID `8763958284`,
+  `sswr-windows-x86_64-msvc-30553085622-1`, size `4531660` bytes, created
+  `2026-07-30T14:53:56Z`, expires `2026-08-13T14:53:54Z`, archive URL
+  `https://api.github.com/repos/CC-Cheunggg/shadowsocks-windows-rs/actions/artifacts/8763958284/zip`.
+  It was not expired. GitHub API and the upload log both reported digest
+  `sha256:b49998bbe08a0c496ddacfae8d12ab5f1d7cba1866a9fc594f3e3158a04aec43`.
+- The original ZIP was downloaded by exact artifact ID into a new task-only
+  directory, finishing at `2026-07-30T23:04:09+0800`. Its path is
+  `/private/tmp/sswr-task10-30553085622-50reVT/sswr-windows-x86_64-msvc-30553085622-1.zip`,
+  its size is `4531660` bytes, and its independently calculated SHA-256 is
+  `b49998bbe08a0c496ddacfae8d12ab5f1d7cba1866a9fc594f3e3158a04aec43`.
+  This exactly matched the normalized GitHub digest. The original bytes were
+  preserved and the ZIP was made read-only (`0444`) for later Task 11 transfer.
+- Central-directory and CRC preflight passed before extraction: ten unique,
+  root-level regular files; no absolute/traversal path, directory, link,
+  special file, encryption, control/dangerous name, duplicate, or
+  case-insensitive collision. Total uncompressed size was `12150475` bytes,
+  maximum compression ratio was `3.13`, and all entries passed CRC testing.
+  Extraction then occurred only into the new task directory's empty
+  `extracted` child.
+- The exact root inventory was:
+  - `BUILD-INFO`
+  - `LICENSE.txt`
+  - `network_recover.exe`
+  - `SHA256SUMS`
+  - `shadowsocks-windows-rs.exe`
+  - `Shadowsocks_0.1.0_x64-setup.exe`
+  - `THIRD_PARTY_NOTICES.md`
+  - `WINTUN-LICENSE.txt`
+  - `wintun.dll`
+  - `wintun_smoke.exe`
+  No subdirectory, hidden file, PDB, cache, target tree, extra EXE/DLL, offline
+  installer, or fixed runtime was present.
+- The exact-commit `scripts/stage-windows-artifact.mjs --verify-only` passed.
+  A separate strict parser and independent SHA-256 calculation also passed:
+  `SHA256SUMS` used LF, ended with LF, omitted itself, listed every other file
+  exactly once with exact spelling, and contained no path or extra entry.
+  File SHA-256 values were:
+  - `BUILD-INFO`:
+    `c07a4b2c341d1d204385cb92007968a01e214517061b8f06aaa99d24a7dd3b98`
+  - `LICENSE.txt`:
+    `f666848c286c965cf6bd74c67577787b6966ae493353afaf062319c33a856c44`
+  - `Shadowsocks_0.1.0_x64-setup.exe`:
+    `34e4281266beed4eae2d06faa6756f58bf28f734fbbce65202d826afd579cbc4`
+  - `THIRD_PARTY_NOTICES.md`:
+    `1aa3a193e2a532bb1d0df670944ec98d3ce4708d0f87f289eb2e5f7c5bc709a4`
+  - `WINTUN-LICENSE.txt`:
+    `183adac21e7d96c508c8fd34d394b7b6708bc81564ad1bad61ab66143a008cd2`
+  - `network_recover.exe`:
+    `7d3095ff5accac9015ff9a4c4d5a6aa3437539b0e062a2279de24647617f525d`
+  - `shadowsocks-windows-rs.exe`:
+    `78072ada3073b97ac3c1080f0244d871f1ef93ba94efd7577a5bfc632ebcb11a`
+  - `wintun.dll`:
+    `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce`
+  - `wintun_smoke.exe`:
+    `95330f2007e06e87d15048f984291d38e070ab05c107a028009ae9dcbd3d4aa4`
+- `BUILD-INFO` parsed as 23 unique fields. Project, version, commit, ref,
+  run/attempt, MSVC target, release profile, NSIS bundle/setup name and hash,
+  `downloadBootstrapper`, `silent=true`, bare-EXE bootstrap, static CRT, and
+  subsystem 2/3/3 all matched. Rust `1.97.1`, Node `22.23.1`, npm `10.9.8`,
+  Tauri CLI `2.11.4`, and project `0.1.0` fields were present and well formed.
+  No secret/token or local absolute path was present.
+- Independent PE parsing of all three Rust EXEs found valid bounded DOS,
+  PE/COFF, section, optional-header, and import-table structures. All were
+  AMD64 PE32+ with non-empty imports. Directly read subsystems were main `2`,
+  recovery `3`, and smoke `3`. No forbidden dynamic MSVC, UCRT, MFC/ATL, or
+  LLVM OpenMP runtime import was present. The exact run's source-EXE static-CRT
+  and subsystem steps also succeeded for all three.
+- Bare-EXE WebView2 bootstrap static evidence passed. The exact commit contains
+  the pre-Tauri implementation; the separately delivered GUI EXE directly
+  contains the fixed official URL, `/silent` and `/install`, and
+  `正在初始化运行环境，请稍候…`. Its import table contains Registry, WinHTTP,
+  WinVerifyTrust/CryptoAPI, `CreateProcessW`, named-mutex, Job Object, and
+  native window/`MessageBoxW` APIs. The exact source uses fixed policies and a
+  securely generated temp path, and contains no PowerShell, pwsh, cmd.exe,
+  curl, ShellExecute, or generated shell-command path. This is static evidence
+  only; no first launch was performed.
+- The sole setup is a valid Nullsoft installer PE (`I386`, PE32, GUI), size
+  `534292` bytes. Its SHA-256 matched `SHA256SUMS` and `BUILD-INFO`.
+  Exact-commit Tauri configuration and its successful CI verifier require
+  `downloadBootstrapper` with `silent=true` and contain neither
+  `offlineInstaller` nor `fixedRuntime`; the small setup and artifact inventory
+  contain no approximately 127 MB offline runtime. The available local archive
+  reader did not support listing NSIS payloads, so no unsupported inner-listing
+  claim is made. The project EXEs and setup have zero PE certificate-table
+  entries and are recorded as unsigned, not falsely claimed as signed.
+- Wintun passed: workflow version `0.14.1`, pinned archive SHA-256
+  `07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51`,
+  DLL SHA-256
+  `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce`,
+  and license SHA-256
+  `183adac21e7d96c508c8fd34d394b7b6708bc81564ad1bad61ab66143a008cd2`
+  all matched. The exact run verified the source DLL hash/signature before
+  staging and the staged DLL signature plus all hashes afterward. Its log
+  reported the allowed signer exactly as `CN=WireGuard LLC, O=WireGuard LLC`
+  (with additional location/organization attributes). macOS had no compatible
+  trusted Authenticode verifier; eligibility therefore relies on the artifact
+  DLL's byte-for-byte pinned hash, this exact run's successful Authenticode
+  gates, and the signer log, as required.
+- Final qualification:
+  `ELIGIBLE FOR TASK 11 READ-ONLY TRANSFER`.
+
 ## Task 11 — Windows read-only refresh and WebView bootstrap check
 
-Status: `PENDING`
+Status: `BLOCKED — native WebView2 bootstrap failed 2026-07-31;
+TASK 12 PROHIBITED`
 
 Scope:
 
@@ -659,12 +816,151 @@ Scope:
 
 Completion gate:
 
-- Read-only evidence is saved and hash-checked.
-- WebView2/app startup passes without a separate installer wizard.
+- Full record:
+  [WINDOWS_TASK11_ACCEPTANCE_30553085622.md](WINDOWS_TASK11_ACCEPTANCE_30553085622.md).
+- Target `177.5.74.14` was reached only through the existing authorized
+  interactive RDP desktop. The process ran as
+  `CLOUD-TI1RM2-2D\Administrator`, SID
+  `S-1-5-21-2232602958-3163185423-148646785-500`, elevated, in session `2`.
+- The exact retained ZIP for run `30553085622`, attempt `1`, artifact
+  `8763958284` / `sswr-windows-x86_64-msvc-30553085622-1`, commit
+  `85c87a7e216f8d2de346e77240a2cd53166bba46`, was transferred without
+  repacking. Windows reverified its size as `4531660` bytes and SHA-256 as
+  `b49998bbe08a0c496ddacfae8d12ab5f1d7cba1866a9fc594f3e3158a04aec43`.
+  The ten-entry inventory, all nine `SHA256SUMS` entries, `BUILD-INFO`, the
+  pinned Wintun hash, and the valid WireGuard LLC Authenticode signature all
+  passed.
+- The new retained remote root is
+  `C:\Users\Administrator\Desktop\sswr-acceptance\task11-30553085622-85c87a7-20260731-0002`.
+  Pre-launch checks found no SSWR process, project Wintun object, project
+  route/address, recovery journal, watchdog/staging task, or auto-connect
+  field. All four official HKLM/HKCU 32/64-bit WebView2 registry probes found
+  no non-zero `pv`.
+- The raw `shadowsocks-windows-rs.exe` was then launched with no arguments from
+  the same interactive RDP PowerShell. It was PID `7944`, parent PID `9052`,
+  session `2`, with the exact extracted path. No setup, helper, smoke, or
+  recovery executable was run. No application child process was observed in
+  the 500 ms timeline, and no application-spawned cmd, PowerShell, pwsh, or
+  curl process appeared.
+- Before that valid launch, an operator entered a forward-slash Windows path
+  in Explorer's address bar. Explorer treated it as a URL and opened ordinary
+  Edge at a failing `c/Users/...` address. This did not start the application;
+  the process timeline distinguishes Edge from the later raw-EXE process.
+  Edge was closed normally and is not counted as bootstrap behavior.
+- A usable screenshot of the native progress window was not obtained. The
+  application instead displayed a native failure dialog titled
+  `Shadowsocks 初始化失败` with
+  `运行环境安装失败。请重试；如仍失败，请联系管理员。`. No separate installer
+  wizard, console window, or unexpected UAC prompt was observed. The main Tauri
+  window never appeared. Per the stop rule, the dialog was closed normally;
+  there was no retry, manual Runtime install, bypass, or second raw-EXE launch.
+- During the valid application process lifetime, the process timeline recorded
+  TCP connections from `177.5.74.14` to `199.232.214.172:443` and
+  `104.83.198.44:443`. It recorded no child installer process. The final four
+  registry probes still found WebView2 absent, no
+  `%TEMP%\sswrs-webview2-*.exe` remained, and no SSWR/helper process remained.
+- Pre/post adapters, IP configuration, addresses, interfaces/metrics, DNS,
+  routes, and default-route evidence matched exactly. The physical management
+  path remained Ethernet ifIndex `6`, LUID `0x0006008004000000`, gateway
+  `177.5.74.254`, route metric `101`, interface metric `15`. The RDP service
+  remained reachable and the final snapshot retained established tuples
+  `177.5.74.14:3389 <- 14.19.62.144:9532` and
+  `177.5.74.14:3389 <- 138.226.239.7:12020`. The raw RDP evidence is retained;
+  the generated `TASK11_FINAL_RDP_EXACT=True` flag is not used because its
+  deeply serialized CIM input could not be parsed back by
+  `ConvertFrom-Json`.
+- Evidence hash-list files are:
+  `evidence\99-final-evidence-sha256.txt` with SHA-256
+  `1fc9ef60322193a97e850ac6b7c6b5cc07d4855d30a2b104133df825d76e0573`,
+  and `evidence-post\99-final-evidence-sha256.txt` with SHA-256
+  `9d33f3512455f2bbf647f82951d37a4f4d2b16ea5ed5d08a333447cd707b5b92`.
+  The local screenshot manifest is
+  `/private/tmp/sswr-task11-30553085622-20260731-0002/SCREENSHOT-SHA256SUMS.txt`,
+  SHA-256
+  `8ab3bcd24381e49ec8f1b1e1bf1ee9eab334fbbf3caf867a36bc4f96ceced4e8`.
+- Completion gate not met: Runtime installation did not complete, Runtime
+  redetection did not pass, initialization-window lifecycle was not fully
+  captured, and the main app did not start. Exact verdict:
+  `任务 11 未通过，禁止开始任务 12`.
+
+### Task 11-R1 — Raw-EXE WebView2 bootstrap failure boundary
+
+Status: `LOCAL DIAGNOSTIC PATCH COMPLETE — ROOT CAUSE NOT PROVEN;
+NEW ARTIFACT AND ONE CONTROLLED RETRY REQUIRED; TASK 12 NOT STARTED`
+
+Scope and result:
+
+- This was a source/evidence-only continuation of Task 11. There was no new
+  Windows connection or launch, Runtime install/repair, registry write,
+  setup/helper execution, DIRECT/Wintun activity, or network mutation.
+- Exact call-chain and boundary analysis is recorded in section 9 of
+  [WINDOWS_TASK11_ACCEPTANCE_30553085622.md](WINDOWS_TASK11_ACCEPTANCE_30553085622.md).
+- The installer-family dialog proves both application-level registry checks
+  returned absent, the mutex and progress-open gates returned success, and the
+  complete WinHTTP/HTTP/body/temp-file/Authenticode/exact-signer chain returned
+  a verified artifact to `SilentInstaller::install()`. Explicit temp cleanup
+  also succeeded; otherwise the old state machine would have displayed the
+  generic cleanup family.
+- The historical implementation collapsed Job Object creation/configuration,
+  `CreateProcessW`, assignment, resume, wait, exit query, drain, and
+  termination into `InstallerLaunch`, discarded non-zero installer exit
+  codes, ignored individual registry-probe errors, and allowed cleanup to
+  replace the primary error. Progress-close and mutex-release errors were also
+  discarded when a primary operation had failed.
+- The valid-launch process observation at `00:31:14` and failure dialog at
+  `00:33:56` are 162 seconds apart. This is inconsistent with the fixed
+  10-minute installer timeout or Runtime-redetection deadline, leaving a
+  collapsed installer-control error or non-zero short-lived child exit. The
+  500 ms no-child sample cannot distinguish those outcomes.
+- The highest-ranked, unproved hypothesis is
+  `installer.create_process / win32:32`: the read-only duplicate retains the
+  same writable file object and original share-open state. Public
+  `CreateProcessW` documentation does not prove the internal image-open share
+  flags, so no handle lifetime, reopen, sharing, or security-policy change was
+  made.
+
+Local patch:
+
+- Adds stable stages for Runtime detection, mutex/progress
+  open/message-loop/close, WinHTTP session/connect/request,
+  HTTP status/redirect, body read, temporary-file
+  create/write/flush/lock/cleanup, Authenticode verify/signer/close, Job Object,
+  `CreateProcessW`, assignment/resume/wait/exit/drain/termination.
+- Preserves typed numeric Win32, WinHTTP, HTTP-status, WinTrust, HRESULT,
+  wait-status, and installer-exit codes only where the API contract supports
+  them.
+- Preserves the primary failure and attaches only the first cleanup/control
+  failure as `secondary`. Registry API failures no longer masquerade as
+  Runtime absence when no view proves installation.
+- Keeps the existing Chinese operator guidance and emits no path, URL, host,
+  certificate/signer value, response body, token, credential, memory content,
+  or unrelated personal information.
+- Leaves the fixed official URL, HTTPS and redirect allowlist, timeout and size
+  limits, exclusive temp creation, Authenticode/exact signer checks, restricted
+  file handle, installer arguments, Job Object, process waits, and cleanup
+  policy unchanged.
+
+Local validation:
+
+- focused bootstrap library tests: `26 passed; 0 failed`;
+- complete library tests: `203 passed; 0 failed`;
+- Windows GNU native compile check for the library and main GUI binary passed;
+- `cargo fmt --check` and `git diff --check` passed.
+
+Stop gate:
+
+- No current artifact contains the patch. Before any retry, a new artifact must
+  be built and independently qualified through the earlier artifact gates.
+- Exactly one later authorized raw-EXE retry must capture the complete
+  `diagnostic`/optional `secondary` dialog lines, same-clock start/failure/exit
+  times, event-based child create/exit evidence, all four read-only Runtime
+  registry probes, and bootstrapper/temp cleanup.
+- Task 11 remains `BLOCKED`. Task 11-R1 stopped. Task 12 remains
+  `BLOCKED / NOT STARTED`.
 
 ## Task 12 — Out-of-band proof and action-time change plan
 
-Status: `PENDING — requires user participation`
+Status: `BLOCKED — Task 11 did not pass; NOT STARTED`
 
 Scope:
 

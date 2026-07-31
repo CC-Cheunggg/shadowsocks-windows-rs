@@ -1,8 +1,9 @@
 use super::{
-    BootstrapClock, BootstrapComponents, BootstrapError, BootstrapMutex, DownloadPolicy,
-    InstallPolicy, InstallerArtifact, InstallerDownloader, ProgressUi, RuntimeDetector,
-    SignatureEvidence, SignatureVerifier, SilentInstaller, bootstrap_and_report,
-    remaining_call_timeout, runtime_version_is_present,
+    BootstrapClock, BootstrapComponents, BootstrapError, BootstrapMutex, BootstrapStage,
+    BootstrapSystemCode, DownloadPolicy, InstallPolicy, InstallerArtifact, InstallerDownloader,
+    ProgressUi, RuntimeDetector, SignatureEvidence, SignatureVerifier, SilentInstaller,
+    bootstrap_and_report, registry_string_byte_length_is_valid, remaining_call_timeout,
+    runtime_version_is_present,
 };
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{File, OpenOptions};
@@ -19,9 +20,9 @@ use std::time::{Duration, Instant};
 use url::Url;
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS,
-    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND,
-    ERROR_SUCCESS, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+    GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_WINDOW, DEFAULT_GUI_FONT, GetStockObject, GetSysColorBrush, UpdateWindow,
@@ -152,6 +153,28 @@ fn duration_millis(duration: Duration) -> u32 {
     duration.as_millis().clamp(1, u32::MAX as u128) as u32
 }
 
+fn last_win32_error(error: BootstrapError, stage: BootstrapStage) -> BootstrapError {
+    // SAFETY: The caller invokes this immediately after the failed Win32 API.
+    let code = unsafe { GetLastError() };
+    error
+        .at_stage(stage)
+        .with_system_code(BootstrapSystemCode::Win32(code))
+}
+
+fn returned_win32_error(error: BootstrapError, stage: BootstrapStage, code: u32) -> BootstrapError {
+    error
+        .at_stage(stage)
+        .with_system_code(BootstrapSystemCode::Win32(code))
+}
+
+fn io_error(error: BootstrapError, stage: BootstrapStage, source: &io::Error) -> BootstrapError {
+    let error = error.at_stage(stage);
+    match source.raw_os_error() {
+        Some(code) => error.with_system_code(BootstrapSystemCode::Win32(code as u32)),
+        None => error,
+    }
+}
+
 struct RegistryKey(HKEY);
 
 impl Drop for RegistryKey {
@@ -176,10 +199,16 @@ impl RegistryRuntimeDetector {
             unsafe { RegOpenKeyExW(root, key_path.as_ptr(), 0, KEY_READ | view, &mut raw_key) };
         match status {
             ERROR_SUCCESS => {}
-            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_PARAMETER => {
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
                 return Ok(None);
             }
-            _ => return Err(BootstrapError::RuntimeDetection),
+            _ => {
+                return Err(returned_win32_error(
+                    BootstrapError::RuntimeDetection,
+                    BootstrapStage::RuntimeInitialDetection,
+                    status,
+                ));
+            }
         }
         let key = RegistryKey(raw_key);
         let value_name = wide("pv");
@@ -201,12 +230,17 @@ impl RegistryRuntimeDetector {
         if status == ERROR_FILE_NOT_FOUND {
             return Ok(None);
         }
-        if status != ERROR_SUCCESS || byte_len == 0 || byte_len as usize > size_of_val(&buffer) {
-            return if status == ERROR_INSUFFICIENT_BUFFER {
-                Ok(None)
-            } else {
-                Err(BootstrapError::RuntimeDetection)
-            };
+        if status != ERROR_SUCCESS {
+            return Err(returned_win32_error(
+                BootstrapError::RuntimeDetection,
+                BootstrapStage::RuntimeInitialDetection,
+                status,
+            ));
+        }
+        if !registry_string_byte_length_is_valid(byte_len as usize, size_of_val(&buffer)) {
+            return Err(
+                BootstrapError::RuntimeDetection.at_stage(BootstrapStage::RuntimeInitialDetection)
+            );
         }
 
         let units = (byte_len as usize / size_of::<u16>()).min(buffer.len());
@@ -222,7 +256,7 @@ impl RegistryRuntimeDetector {
 
 impl RuntimeDetector for RegistryRuntimeDetector {
     fn is_installed(&mut self) -> Result<bool, BootstrapError> {
-        let mut saw_probe_error = false;
+        let mut first_probe_error = None;
         for root in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
             for view in [KEY_WOW64_32KEY, KEY_WOW64_64KEY] {
                 match Self::query_view(root, view) {
@@ -230,14 +264,15 @@ impl RuntimeDetector for RegistryRuntimeDetector {
                         return Ok(true);
                     }
                     Ok(_) => {}
-                    Err(_) => saw_probe_error = true,
+                    Err(error) => {
+                        first_probe_error.get_or_insert(error);
+                    }
                 }
             }
         }
-        if saw_probe_error {
-            Err(BootstrapError::RuntimeDetection)
-        } else {
-            Ok(false)
+        match first_probe_error {
+            Some(error) => Err(error),
+            None => Ok(false),
         }
     }
 }
@@ -269,7 +304,10 @@ impl BootstrapMutex for NamedBootstrapMutex {
         // SAFETY: The name is a valid, terminated UTF-16 string.
         self.handle = unsafe { CreateMutexW(null(), 1, name.as_ptr()) };
         if self.handle.is_null() {
-            return Err(BootstrapError::MutexAcquire);
+            return Err(last_win32_error(
+                BootstrapError::MutexAcquire,
+                BootstrapStage::MutexCreate,
+            ));
         }
         // SAFETY: GetLastError is read immediately after CreateMutexW.
         let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
@@ -285,13 +323,23 @@ impl BootstrapMutex for NamedBootstrapMutex {
                 self.owned = true;
                 Ok(())
             }
-            WAIT_TIMEOUT | WAIT_FAILED => {
+            WAIT_TIMEOUT => {
                 self.close_handle();
-                Err(BootstrapError::MutexAcquire)
+                Err(BootstrapError::MutexAcquire
+                    .at_stage(BootstrapStage::MutexWait)
+                    .with_system_code(BootstrapSystemCode::WaitStatus(WAIT_TIMEOUT)))
             }
-            _ => {
+            WAIT_FAILED => {
+                let error =
+                    last_win32_error(BootstrapError::MutexAcquire, BootstrapStage::MutexWait);
                 self.close_handle();
-                Err(BootstrapError::MutexAcquire)
+                Err(error)
+            }
+            status => {
+                self.close_handle();
+                Err(BootstrapError::MutexAcquire
+                    .at_stage(BootstrapStage::MutexWait)
+                    .with_system_code(BootstrapSystemCode::WaitStatus(status)))
             }
         }
     }
@@ -303,12 +351,19 @@ impl BootstrapMutex for NamedBootstrapMutex {
         }
         // SAFETY: The current thread owns this mutex after a successful acquire.
         let released = unsafe { ReleaseMutex(self.handle) } != 0;
+        let release_error = if released {
+            None
+        } else {
+            Some(last_win32_error(
+                BootstrapError::MutexRelease,
+                BootstrapStage::MutexRelease,
+            ))
+        };
         self.owned = false;
         self.close_handle();
-        if released {
-            Ok(())
-        } else {
-            Err(BootstrapError::MutexRelease)
+        match release_error {
+            None => Ok(()),
+            Some(error) => Err(error),
         }
     }
 }
@@ -329,9 +384,9 @@ impl Drop for NamedBootstrapMutex {
 struct InternetHandle(*mut c_void);
 
 impl InternetHandle {
-    fn new(raw: *mut c_void) -> Result<Self, BootstrapError> {
+    fn new(raw: *mut c_void, stage: BootstrapStage) -> Result<Self, BootstrapError> {
         if raw.is_null() {
-            Err(last_download_error())
+            Err(last_download_error(stage))
         } else {
             Ok(Self(raw))
         }
@@ -354,16 +409,25 @@ struct HttpResponse {
     _connection: InternetHandle,
 }
 
-fn last_download_error() -> BootstrapError {
+fn last_download_error(stage: BootstrapStage) -> BootstrapError {
     // SAFETY: Reading the current thread's last-error value has no preconditions.
-    if unsafe { GetLastError() } == ERROR_WINHTTP_TIMEOUT {
+    let code = unsafe { GetLastError() };
+    let error = if code == ERROR_WINHTTP_TIMEOUT {
         BootstrapError::DownloadTimeout
     } else {
         BootstrapError::DownloadFailed
-    }
+    };
+    error
+        .at_stage(stage)
+        .with_system_code(BootstrapSystemCode::WinHttp(code))
 }
 
-fn set_http_option<T>(handle: *const c_void, option: u32, value: &T) -> Result<(), BootstrapError> {
+fn set_http_option<T>(
+    handle: *const c_void,
+    option: u32,
+    value: &T,
+    stage: BootstrapStage,
+) -> Result<(), BootstrapError> {
     // SAFETY: value points to an initialized fixed-size option value.
     let ok = unsafe {
         WinHttpSetOption(
@@ -374,7 +438,7 @@ fn set_http_option<T>(handle: *const c_void, option: u32, value: &T) -> Result<(
         )
     };
     if ok == 0 {
-        Err(last_download_error())
+        Err(last_download_error(stage))
     } else {
         Ok(())
     }
@@ -384,13 +448,18 @@ fn set_deadline_timeouts(
     handle: *mut c_void,
     started: Instant,
     policy: DownloadPolicy,
+    stage: BootstrapStage,
 ) -> Result<(), BootstrapError> {
     let elapsed = started.elapsed();
     let timeouts = policy.timeouts;
-    let resolve = remaining_call_timeout(timeouts.total, elapsed, timeouts.resolve)?;
-    let connect = remaining_call_timeout(timeouts.total, elapsed, timeouts.connect)?;
-    let send = remaining_call_timeout(timeouts.total, elapsed, timeouts.send)?;
-    let read = remaining_call_timeout(timeouts.total, elapsed, timeouts.read)?;
+    let resolve = remaining_call_timeout(timeouts.total, elapsed, timeouts.resolve)
+        .map_err(|error| error.at_stage(stage))?;
+    let connect = remaining_call_timeout(timeouts.total, elapsed, timeouts.connect)
+        .map_err(|error| error.at_stage(stage))?;
+    let send = remaining_call_timeout(timeouts.total, elapsed, timeouts.send)
+        .map_err(|error| error.at_stage(stage))?;
+    let read = remaining_call_timeout(timeouts.total, elapsed, timeouts.read)
+        .map_err(|error| error.at_stage(stage))?;
     // SAFETY: The handle is a live WinHTTP request and all timeout values are finite.
     let ok = unsafe {
         WinHttpSetTimeouts(
@@ -402,7 +471,7 @@ fn set_deadline_timeouts(
         )
     };
     if ok == 0 {
-        Err(last_download_error())
+        Err(last_download_error(stage))
     } else {
         Ok(())
     }
@@ -411,15 +480,18 @@ fn set_deadline_timeouts(
 fn open_session(policy: DownloadPolicy) -> Result<InternetHandle, BootstrapError> {
     let agent = wide("ShadowsocksWindowsRS-WebView2Bootstrap/1");
     // SAFETY: All strings are terminated and optional proxy pointers are null.
-    let session = InternetHandle::new(unsafe {
-        WinHttpOpen(
-            agent.as_ptr(),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            null(),
-            null(),
-            WINHTTP_FLAG_SECURE_DEFAULTS,
-        )
-    })?;
+    let session = InternetHandle::new(
+        unsafe {
+            WinHttpOpen(
+                agent.as_ptr(),
+                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                null(),
+                null(),
+                WINHTTP_FLAG_SECURE_DEFAULTS,
+            )
+        },
+        BootstrapStage::WinHttpSession,
+    )?;
     let timeouts = policy.timeouts;
     // SAFETY: The handle is a live WinHTTP session and timeout values are bounded i32 values.
     let ok = unsafe {
@@ -432,29 +504,33 @@ fn open_session(policy: DownloadPolicy) -> Result<InternetHandle, BootstrapError
         )
     };
     if ok == 0 {
-        return Err(last_download_error());
+        return Err(last_download_error(BootstrapStage::WinHttpSession));
     }
     set_http_option(
         session.0.cast_const(),
         WINHTTP_OPTION_REDIRECT_POLICY,
         &WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+        BootstrapStage::WinHttpSession,
     )?;
     let reject_user_info: i32 = 1;
     set_http_option(
         session.0.cast_const(),
         WINHTTP_OPTION_REJECT_USERPWD_IN_URL,
         &reject_user_info,
+        BootstrapStage::WinHttpSession,
     )?;
     set_http_option(
         session.0.cast_const(),
         WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
         &RESPONSE_HEADER_LIMIT,
+        BootstrapStage::WinHttpSession,
     )?;
     let connect_retries = 1u32;
     set_http_option(
         session.0.cast_const(),
         WINHTTP_OPTION_CONNECT_RETRIES,
         &connect_retries,
+        BootstrapStage::WinHttpSession,
     )?;
     Ok(session)
 }
@@ -478,45 +554,70 @@ fn open_response(
     started: Instant,
     policy: DownloadPolicy,
 ) -> Result<HttpResponse, BootstrapError> {
-    policy.timeouts.validate_elapsed(started.elapsed())?;
+    policy
+        .timeouts
+        .validate_elapsed(started.elapsed())
+        .map_err(|error| error.at_stage(BootstrapStage::WinHttpConnect))?;
     let host = wide(url.host_str().ok_or(BootstrapError::DownloadUrl)?);
     let port = url
         .port_or_known_default()
         .ok_or(BootstrapError::DownloadUrl)?;
     // SAFETY: session is valid and host is a terminated UTF-16 string.
-    let connection =
-        InternetHandle::new(unsafe { WinHttpConnect(session.0, host.as_ptr(), port, 0) })?;
+    let connection = InternetHandle::new(
+        unsafe { WinHttpConnect(session.0, host.as_ptr(), port, 0) },
+        BootstrapStage::WinHttpConnect,
+    )?;
     let method = wide("GET");
     let object = wide(request_path(url));
     // SAFETY: All handles and strings remain valid for the call.
-    let request = InternetHandle::new(unsafe {
-        WinHttpOpenRequest(
-            connection.0,
-            method.as_ptr(),
-            object.as_ptr(),
-            null(),
-            null(),
-            null(),
-            WINHTTP_FLAG_SECURE as WINHTTP_OPEN_REQUEST_FLAGS,
-        )
-    })?;
+    let request = InternetHandle::new(
+        unsafe {
+            WinHttpOpenRequest(
+                connection.0,
+                method.as_ptr(),
+                object.as_ptr(),
+                null(),
+                null(),
+                null(),
+                WINHTTP_FLAG_SECURE as WINHTTP_OPEN_REQUEST_FLAGS,
+            )
+        },
+        BootstrapStage::WinHttpRequestOpen,
+    )?;
     set_http_option(
         request.0.cast_const(),
         WINHTTP_OPTION_REDIRECT_POLICY,
         &WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+        BootstrapStage::WinHttpRequestOpen,
     )?;
-    set_deadline_timeouts(request.0, started, policy)?;
+    set_deadline_timeouts(
+        request.0,
+        started,
+        policy,
+        BootstrapStage::WinHttpRequestOpen,
+    )?;
     // SAFETY: The request is valid and this GET has no additional headers or body.
     if unsafe { WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) } == 0 {
-        return Err(last_download_error());
+        return Err(last_download_error(BootstrapStage::WinHttpRequestSend));
     }
-    policy.timeouts.validate_elapsed(started.elapsed())?;
-    set_deadline_timeouts(request.0, started, policy)?;
+    policy
+        .timeouts
+        .validate_elapsed(started.elapsed())
+        .map_err(|error| error.at_stage(BootstrapStage::WinHttpRequestSend))?;
+    set_deadline_timeouts(
+        request.0,
+        started,
+        policy,
+        BootstrapStage::WinHttpResponseReceive,
+    )?;
     // SAFETY: The request is valid; the reserved parameter must be null.
     if unsafe { WinHttpReceiveResponse(request.0, null_mut()) } == 0 {
-        return Err(last_download_error());
+        return Err(last_download_error(BootstrapStage::WinHttpResponseReceive));
     }
-    policy.timeouts.validate_elapsed(started.elapsed())?;
+    policy
+        .timeouts
+        .validate_elapsed(started.elapsed())
+        .map_err(|error| error.at_stage(BootstrapStage::WinHttpResponseReceive))?;
     Ok(HttpResponse {
         request,
         _connection: connection,
@@ -538,9 +639,17 @@ fn response_status(request: &InternetHandle) -> Result<u32, BootstrapError> {
         )
     };
     if ok == 0 {
-        Err(last_download_error())
+        Err(last_download_error(BootstrapStage::HttpStatus))
     } else {
         Ok(status)
+    }
+}
+
+fn stage_for_header_query(query: u32) -> BootstrapStage {
+    if query == WINHTTP_QUERY_LOCATION {
+        BootstrapStage::HttpRedirect
+    } else {
+        BootstrapStage::HttpStatus
     }
 }
 
@@ -569,8 +678,16 @@ fn optional_header(
     if error == ERROR_WINHTTP_HEADER_NOT_FOUND {
         return Ok(None);
     }
-    if error != ERROR_INSUFFICIENT_BUFFER || byte_len == 0 || byte_len as usize > byte_limit {
-        return Err(BootstrapError::DownloadFailed);
+    if error != ERROR_INSUFFICIENT_BUFFER {
+        return Err(BootstrapError::DownloadFailed
+            .at_stage(stage_for_header_query(query))
+            .with_system_code(BootstrapSystemCode::WinHttp(error)));
+    }
+    if byte_len == 0 {
+        return Err(BootstrapError::DownloadFailed.at_stage(stage_for_header_query(query)));
+    }
+    if byte_len as usize > byte_limit {
+        return Err(BootstrapError::DownloadTooLarge.at_stage(stage_for_header_query(query)));
     }
 
     let mut buffer = vec![0u16; (byte_len as usize / size_of::<u16>()) + 1];
@@ -587,15 +704,15 @@ fn optional_header(
         )
     };
     if ok == 0 {
-        return Err(last_download_error());
+        return Err(last_download_error(stage_for_header_query(query)));
     }
     let units = (actual as usize / size_of::<u16>()).min(buffer.len());
     let terminator = buffer[..units]
         .iter()
         .position(|unit| *unit == 0)
         .unwrap_or(units);
-    let value =
-        String::from_utf16(&buffer[..terminator]).map_err(|_| BootstrapError::DownloadFailed)?;
+    let value = String::from_utf16(&buffer[..terminator])
+        .map_err(|_| BootstrapError::DownloadFailed.at_stage(stage_for_header_query(query)))?;
     Ok(Some(value))
 }
 
@@ -604,8 +721,11 @@ fn content_length(request: &InternetHandle, policy: DownloadPolicy) -> Result<()
         let length = raw
             .trim()
             .parse::<u64>()
-            .map_err(|_| BootstrapError::DownloadFailed)?;
-        policy.limits.validate_content_length(length)?;
+            .map_err(|_| BootstrapError::DownloadFailed.at_stage(BootstrapStage::HttpStatus))?;
+        policy
+            .limits
+            .validate_content_length(length)
+            .map_err(|error| error.at_stage(BootstrapStage::HttpStatus))?;
     }
     Ok(())
 }
@@ -659,7 +779,13 @@ impl InstallerArtifact for NativeInstallerArtifact {
                 Err(_) if attempt + 1 < TEMP_DELETE_ATTEMPTS => {
                     thread::sleep(TEMP_DELETE_RETRY_INTERVAL);
                 }
-                Err(_) => return Err(BootstrapError::Cleanup),
+                Err(error) => {
+                    return Err(io_error(
+                        BootstrapError::Cleanup,
+                        BootstrapStage::TemporaryFileCleanup,
+                        &error,
+                    ));
+                }
             }
         }
         Err(BootstrapError::Cleanup)
@@ -677,16 +803,25 @@ fn create_secure_temp_file() -> Result<(PathBuf, File), BootstrapError> {
     // SAFETY: The bounded writable UTF-16 buffer is valid.
     let length =
         unsafe { GetTempPathW(temp_buffer.len() as u32, temp_buffer.as_mut_ptr()) } as usize;
-    if length == 0 || length >= temp_buffer.len() {
-        return Err(BootstrapError::TemporaryFile);
+    if length == 0 {
+        return Err(last_win32_error(
+            BootstrapError::TemporaryFile,
+            BootstrapStage::TemporaryFileCreate,
+        ));
+    }
+    if length >= temp_buffer.len() {
+        return Err(BootstrapError::TemporaryFile.at_stage(BootstrapStage::TemporaryFileCreate));
     }
     let temp_directory = PathBuf::from(OsString::from_wide(&temp_buffer[..length]));
 
     for _ in 0..16 {
         let mut guid = GUID::default();
         // SAFETY: guid points to initialized writable storage.
-        if unsafe { CoCreateGuid(&mut guid) } != 0 {
-            return Err(BootstrapError::TemporaryFile);
+        let status = unsafe { CoCreateGuid(&mut guid) };
+        if status != 0 {
+            return Err(BootstrapError::TemporaryFile
+                .at_stage(BootstrapStage::TemporaryFileCreate)
+                .with_system_code(BootstrapSystemCode::HResult(status)));
         }
         let name = format!(
             "sswrs-webview2-{:08x}{:04x}{:04x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.exe",
@@ -713,7 +848,13 @@ fn create_secure_temp_file() -> Result<(PathBuf, File), BootstrapError> {
         {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(BootstrapError::TemporaryFile),
+            Err(error) => {
+                return Err(io_error(
+                    BootstrapError::TemporaryFile,
+                    BootstrapStage::TemporaryFileCreate,
+                    &error,
+                ));
+            }
         }
     }
     Err(BootstrapError::TemporaryFile)
@@ -734,8 +875,14 @@ fn duplicate_read_only(file: &File) -> Result<File, BootstrapError> {
             0,
         )
     };
-    if ok == 0 || duplicate.is_null() {
-        return Err(BootstrapError::TemporaryFile);
+    if ok == 0 {
+        return Err(last_win32_error(
+            BootstrapError::TemporaryFile,
+            BootstrapStage::TemporaryFileLock,
+        ));
+    }
+    if duplicate.is_null() {
+        return Err(BootstrapError::TemporaryFile.at_stage(BootstrapStage::TemporaryFileLock));
     }
     // SAFETY: DuplicateHandle returned a newly owned file handle.
     Ok(unsafe { File::from_raw_handle(duplicate as RawHandle) })
@@ -757,7 +904,10 @@ impl InstallerDownloader for WinHttpDownloader {
         let mut redirects = 0usize;
 
         loop {
-            policy.timeouts.validate_elapsed(started.elapsed())?;
+            policy
+                .timeouts
+                .validate_elapsed(started.elapsed())
+                .map_err(|error| error.at_stage(BootstrapStage::WinHttpRequestOpen))?;
             let response = open_response(&session, &current, started, policy)?;
             let status = response_status(&response.request)?;
             if is_redirect(status) {
@@ -766,14 +916,19 @@ impl InstallerDownloader for WinHttpDownloader {
                     WINHTTP_QUERY_LOCATION,
                     policy.limits.max_location_header_bytes,
                 )?
-                .ok_or(BootstrapError::DownloadFailed)?;
+                .ok_or(BootstrapError::DownloadFailed.at_stage(BootstrapStage::HttpRedirect))?;
                 current = policy.redirects.follow(&current, &location, redirects)?;
                 redirects += 1;
-                policy.timeouts.validate_elapsed(started.elapsed())?;
+                policy
+                    .timeouts
+                    .validate_elapsed(started.elapsed())
+                    .map_err(|error| error.at_stage(BootstrapStage::HttpRedirect))?;
                 continue;
             }
             if status != 200 {
-                return Err(BootstrapError::DownloadFailed);
+                return Err(BootstrapError::DownloadFailed
+                    .at_stage(BootstrapStage::HttpStatus)
+                    .with_system_code(BootstrapSystemCode::HttpStatus(status)));
             }
             content_length(&response.request, policy)?;
 
@@ -783,7 +938,12 @@ impl InstallerDownloader for WinHttpDownloader {
                 let mut downloaded = 0u64;
                 let mut buffer = vec![0u8; READ_BUFFER_BYTES];
                 loop {
-                    set_deadline_timeouts(response.request.0, started, policy)?;
+                    set_deadline_timeouts(
+                        response.request.0,
+                        started,
+                        policy,
+                        BootstrapStage::DownloadRead,
+                    )?;
                     let mut read = 0u32;
                     // SAFETY: request is valid and buffer is writable for the advertised length.
                     let ok = unsafe {
@@ -795,7 +955,7 @@ impl InstallerDownloader for WinHttpDownloader {
                         )
                     };
                     if ok == 0 {
-                        return Err(last_download_error());
+                        return Err(last_download_error(BootstrapStage::DownloadRead));
                     }
                     if read == 0 {
                         break;
@@ -804,24 +964,44 @@ impl InstallerDownloader for WinHttpDownloader {
                     artifact
                         .locked_file
                         .as_mut()
-                        .ok_or(BootstrapError::TemporaryFile)?
+                        .ok_or(
+                            BootstrapError::TemporaryFile
+                                .at_stage(BootstrapStage::TemporaryFileWrite),
+                        )?
                         .write_all(&buffer[..read as usize])
-                        .map_err(|_| BootstrapError::TemporaryFile)?;
-                    policy.timeouts.validate_elapsed(started.elapsed())?;
+                        .map_err(|error| {
+                            io_error(
+                                BootstrapError::TemporaryFile,
+                                BootstrapStage::TemporaryFileWrite,
+                                &error,
+                            )
+                        })?;
+                    policy
+                        .timeouts
+                        .validate_elapsed(started.elapsed())
+                        .map_err(|error| error.at_stage(BootstrapStage::DownloadRead))?;
                 }
                 artifact
                     .locked_file
                     .as_ref()
-                    .ok_or(BootstrapError::TemporaryFile)?
+                    .ok_or(
+                        BootstrapError::TemporaryFile.at_stage(BootstrapStage::TemporaryFileFlush),
+                    )?
                     .sync_all()
-                    .map_err(|_| BootstrapError::TemporaryFile)?;
-                policy.timeouts.validate_elapsed(started.elapsed())?;
-                let locked = duplicate_read_only(
-                    artifact
-                        .locked_file
-                        .as_ref()
-                        .ok_or(BootstrapError::TemporaryFile)?,
-                )?;
+                    .map_err(|error| {
+                        io_error(
+                            BootstrapError::TemporaryFile,
+                            BootstrapStage::TemporaryFileFlush,
+                            &error,
+                        )
+                    })?;
+                policy
+                    .timeouts
+                    .validate_elapsed(started.elapsed())
+                    .map_err(|error| error.at_stage(BootstrapStage::TemporaryFileFlush))?;
+                let locked = duplicate_read_only(artifact.locked_file.as_ref().ok_or(
+                    BootstrapError::TemporaryFile.at_stage(BootstrapStage::TemporaryFileLock),
+                )?)?;
                 artifact.locked_file = Some(locked);
                 Ok(())
             })();
@@ -829,7 +1009,7 @@ impl InstallerDownloader for WinHttpDownloader {
             if let Err(error) = result {
                 return match artifact.cleanup() {
                     Ok(()) => Err(error),
-                    Err(_) => Err(BootstrapError::Cleanup),
+                    Err(cleanup_error) => Err(error.with_secondary(cleanup_error)),
                 };
             }
             return Ok(Box::new(artifact));
@@ -842,26 +1022,55 @@ struct WinTrustSignatureVerifier;
 impl WinTrustSignatureVerifier {
     unsafe fn signer_organization(trust_data: &WINTRUST_DATA) -> Result<String, BootstrapError> {
         if trust_data.hWVTStateData.is_null() {
-            return Err(BootstrapError::SignatureInspection);
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
         }
         // SAFETY: The state handle is live until WTD_STATEACTION_CLOSE.
         let provider = unsafe { WTHelperProvDataFromStateData(trust_data.hWVTStateData) };
-        if provider.is_null() || unsafe { (*provider).dwError } != 0 {
-            return Err(BootstrapError::SignatureInspection);
+        if provider.is_null() {
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
+        }
+        let provider_error = unsafe { (*provider).dwError };
+        if provider_error != 0 {
+            return Err(BootstrapError::SignatureInspection
+                .at_stage(BootstrapStage::AuthenticodeSigner)
+                .with_system_code(BootstrapSystemCode::WinTrust(provider_error as i32)));
         }
         // SAFETY: provider is returned from the active WinTrust state.
         let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, 0, 0) };
-        if signer.is_null() || unsafe { (*signer).dwError } != 0 {
-            return Err(BootstrapError::SignatureInspection);
+        if signer.is_null() {
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
+        }
+        let signer_error = unsafe { (*signer).dwError };
+        if signer_error != 0 {
+            return Err(BootstrapError::SignatureInspection
+                .at_stage(BootstrapStage::AuthenticodeSigner)
+                .with_system_code(BootstrapSystemCode::WinTrust(signer_error as i32)));
         }
         // SAFETY: signer is the primary publisher signer from the active state.
         let provider_certificate = unsafe { WTHelperGetProvCertFromChain(signer, 0) };
-        if provider_certificate.is_null()
-            || unsafe { (*provider_certificate).pCert }.is_null()
-            || unsafe { (*provider_certificate).dwError } != 0
+        if provider_certificate.is_null() {
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
+        }
+        let certificate_error = unsafe { (*provider_certificate).dwError };
+        if certificate_error != 0 {
+            return Err(BootstrapError::SignatureInspection
+                .at_stage(BootstrapStage::AuthenticodeSigner)
+                .with_system_code(BootstrapSystemCode::WinTrust(certificate_error as i32)));
+        }
+        if unsafe { (*provider_certificate).pCert }.is_null()
             || unsafe { (*provider_certificate).fTestCert } != 0
         {
-            return Err(BootstrapError::SignatureInspection);
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
         }
         let certificate = unsafe { (*provider_certificate).pCert };
         // SAFETY: certificate and the organization OID are valid for the active state.
@@ -875,8 +1084,15 @@ impl WinTrustSignatureVerifier {
                 0,
             )
         };
+        if length == 0 {
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
+        }
         if length <= 1 || length > 512 {
-            return Err(BootstrapError::SignatureInspection);
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
         }
         let mut buffer = vec![0u16; length as usize];
         // SAFETY: buffer has the exact bounded size requested by CertGetNameStringW.
@@ -890,11 +1106,19 @@ impl WinTrustSignatureVerifier {
                 buffer.len() as u32,
             )
         };
-        if written != length {
-            return Err(BootstrapError::SignatureInspection);
+        if written == 0 {
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
         }
-        String::from_utf16(&buffer[..buffer.len() - 1])
-            .map_err(|_| BootstrapError::SignatureInspection)
+        if written != length {
+            return Err(
+                BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+            );
+        }
+        String::from_utf16(&buffer[..buffer.len() - 1]).map_err(|_| {
+            BootstrapError::SignatureInspection.at_stage(BootstrapStage::AuthenticodeSigner)
+        })
     }
 }
 
@@ -944,7 +1168,9 @@ impl SignatureVerifier for WinTrustSignatureVerifier {
             unsafe { Self::signer_organization(&trust_data) }
                 .map(|organization| SignatureEvidence::Trusted { organization })
         } else {
-            Ok(SignatureEvidence::Invalid)
+            Err(BootstrapError::SignatureRejected
+                .at_stage(BootstrapStage::AuthenticodeVerify)
+                .with_system_code(BootstrapSystemCode::WinTrust(status)))
         };
 
         trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
@@ -957,7 +1183,13 @@ impl SignatureVerifier for WinTrustSignatureVerifier {
             )
         };
         if close_status != 0 {
-            return Err(BootstrapError::SignatureInspection);
+            let close_error = BootstrapError::SignatureInspection
+                .at_stage(BootstrapStage::AuthenticodeClose)
+                .with_system_code(BootstrapSystemCode::WinTrust(close_status));
+            return match evidence {
+                Ok(_) => Err(close_error),
+                Err(error) => Err(error.with_secondary(close_error)),
+            };
         }
         evidence
     }
@@ -966,9 +1198,9 @@ impl SignatureVerifier for WinTrustSignatureVerifier {
 struct OwnedHandle(HANDLE);
 
 impl OwnedHandle {
-    fn new(handle: HANDLE) -> Result<Self, BootstrapError> {
+    fn new(handle: HANDLE, stage: BootstrapStage) -> Result<Self, BootstrapError> {
         if handle.is_null() {
-            Err(BootstrapError::InstallerLaunch)
+            Err(last_win32_error(BootstrapError::InstallerLaunch, stage))
         } else {
             Ok(Self(handle))
         }
@@ -986,13 +1218,37 @@ impl Drop for OwnedHandle {
     }
 }
 
-fn terminate_suspended_process(process: HANDLE) {
-    if !process.is_null() {
-        // SAFETY: Best-effort termination and bounded wait of a process we created suspended.
-        unsafe {
-            TerminateProcess(process, 1);
-            WaitForSingleObject(process, duration_millis(PROCESS_TERMINATION_WAIT));
-        }
+fn terminate_suspended_process(process: HANDLE) -> Result<(), BootstrapError> {
+    if process.is_null() {
+        return Ok(());
+    }
+    // SAFETY: Best-effort termination of a process we created suspended.
+    let termination_error = if unsafe { TerminateProcess(process, 1) } == 0 {
+        Some(last_win32_error(
+            BootstrapError::InstallerLaunch,
+            BootstrapStage::InstallerTerminate,
+        ))
+    } else {
+        None
+    };
+    // SAFETY: process is a live waitable process handle.
+    let wait = unsafe { WaitForSingleObject(process, duration_millis(PROCESS_TERMINATION_WAIT)) };
+    let wait_error = match wait {
+        WAIT_OBJECT_0 => None,
+        WAIT_FAILED => Some(last_win32_error(
+            BootstrapError::InstallerLaunch,
+            BootstrapStage::InstallerTerminate,
+        )),
+        status => Some(
+            BootstrapError::InstallerLaunch
+                .at_stage(BootstrapStage::InstallerTerminate)
+                .with_system_code(BootstrapSystemCode::WaitStatus(status)),
+        ),
+    };
+    match (termination_error, wait_error) {
+        (Some(error), Some(wait_error)) => Err(error.with_secondary(wait_error)),
+        (Some(error), None) | (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
     }
 }
 
@@ -1023,28 +1279,39 @@ fn active_job_processes(job: HANDLE) -> Result<u32, BootstrapError> {
         )
     };
     if ok == 0 {
-        Err(BootstrapError::InstallerLaunch)
+        Err(last_win32_error(
+            BootstrapError::InstallerLaunch,
+            BootstrapStage::InstallerJobDrain,
+        ))
     } else {
         Ok(accounting.ActiveProcesses)
     }
 }
 
-fn terminate_job_and_wait_idle(job: HANDLE) -> bool {
+fn terminate_job_and_wait_idle(job: HANDLE) -> Result<(), BootstrapError> {
     // SAFETY: The handle is an owned Job Object configured for this installer tree.
     if unsafe { TerminateJobObject(job, 1) } == 0 {
-        return false;
+        return Err(last_win32_error(
+            BootstrapError::InstallerLaunch,
+            BootstrapStage::InstallerTerminate,
+        ));
     }
     let started = Instant::now();
     loop {
         match active_job_processes(job) {
-            Ok(0) => return true,
+            Ok(0) => return Ok(()),
             Ok(_) if started.elapsed() < PROCESS_TERMINATION_WAIT => {
                 thread::sleep(
                     JOB_IDLE_POLL_INTERVAL
                         .min(PROCESS_TERMINATION_WAIT.saturating_sub(started.elapsed())),
                 );
             }
-            Ok(_) | Err(_) => return false,
+            Ok(_) => {
+                return Err(
+                    BootstrapError::InstallerLaunch.at_stage(BootstrapStage::InstallerJobDrain)
+                );
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -1062,7 +1329,10 @@ impl SilentInstaller for JobControlledInstaller {
         }
         let started = Instant::now();
         // SAFETY: Null security/name pointers request an unnamed job with default security.
-        let job = OwnedHandle::new(unsafe { CreateJobObjectW(null(), null()) })?;
+        let job = OwnedHandle::new(
+            unsafe { CreateJobObjectW(null(), null()) },
+            BootstrapStage::InstallerJobCreate,
+        )?;
         let mut job_limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         job_limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: job_limits is initialized and has the exact documented structure size.
@@ -1075,7 +1345,10 @@ impl SilentInstaller for JobControlledInstaller {
             )
         };
         if configured == 0 {
-            return Err(BootstrapError::InstallerLaunch);
+            return Err(last_win32_error(
+                BootstrapError::InstallerLaunch,
+                BootstrapStage::InstallerJobConfigure,
+            ));
         }
 
         let application = wide(artifact.path().as_os_str());
@@ -1104,8 +1377,16 @@ impl SilentInstaller for JobControlledInstaller {
             )
         };
         if created == 0 || process_info.hProcess.is_null() || process_info.hThread.is_null() {
+            let create_error = if created == 0 {
+                last_win32_error(
+                    BootstrapError::InstallerLaunch,
+                    BootstrapStage::InstallerCreateProcess,
+                )
+            } else {
+                BootstrapError::InstallerLaunch.at_stage(BootstrapStage::InstallerCreateProcess)
+            };
+            let termination = terminate_suspended_process(process_info.hProcess);
             if !process_info.hProcess.is_null() {
-                terminate_suspended_process(process_info.hProcess);
                 unsafe {
                     CloseHandle(process_info.hProcess);
                 }
@@ -1115,19 +1396,34 @@ impl SilentInstaller for JobControlledInstaller {
                     CloseHandle(process_info.hThread);
                 }
             }
-            return Err(BootstrapError::InstallerLaunch);
+            return match termination {
+                Ok(()) => Err(create_error),
+                Err(termination_error) => Err(create_error.with_secondary(termination_error)),
+            };
         }
         let process = OwnedHandle(process_info.hProcess);
         let thread = OwnedHandle(process_info.hThread);
         // SAFETY: The child is still suspended, so it cannot escape before job assignment.
         if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
-            terminate_suspended_process(process.0);
-            return Err(BootstrapError::InstallerLaunch);
+            let error = last_win32_error(
+                BootstrapError::InstallerLaunch,
+                BootstrapStage::InstallerAssignJob,
+            );
+            return match terminate_suspended_process(process.0) {
+                Ok(()) => Err(error),
+                Err(termination_error) => Err(error.with_secondary(termination_error)),
+            };
         }
         // SAFETY: thread is the suspended primary thread from CreateProcessW.
         if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            let _ = terminate_job_and_wait_idle(job.0);
-            return Err(BootstrapError::InstallerLaunch);
+            let error = last_win32_error(
+                BootstrapError::InstallerLaunch,
+                BootstrapStage::InstallerResume,
+            );
+            return match terminate_job_and_wait_idle(job.0) {
+                Ok(()) => Err(error),
+                Err(termination_error) => Err(error.with_secondary(termination_error)),
+            };
         }
         drop(thread);
 
@@ -1137,42 +1433,73 @@ impl SilentInstaller for JobControlledInstaller {
         match wait {
             WAIT_OBJECT_0 => {}
             WAIT_TIMEOUT => {
-                if !terminate_job_and_wait_idle(job.0) {
-                    return Err(BootstrapError::InstallerLaunch);
-                }
-                return Err(BootstrapError::InstallerTimeout);
+                let error = BootstrapError::InstallerTimeout
+                    .at_stage(BootstrapStage::InstallerWait)
+                    .with_system_code(BootstrapSystemCode::WaitStatus(WAIT_TIMEOUT));
+                return match terminate_job_and_wait_idle(job.0) {
+                    Ok(()) => Err(error),
+                    Err(termination_error) => Err(error.with_secondary(termination_error)),
+                };
             }
-            _ => {
-                let _ = terminate_job_and_wait_idle(job.0);
-                return Err(BootstrapError::InstallerLaunch);
+            WAIT_FAILED => {
+                let error = last_win32_error(
+                    BootstrapError::InstallerLaunch,
+                    BootstrapStage::InstallerWait,
+                );
+                return match terminate_job_and_wait_idle(job.0) {
+                    Ok(()) => Err(error),
+                    Err(termination_error) => Err(error.with_secondary(termination_error)),
+                };
+            }
+            status => {
+                let error = BootstrapError::InstallerLaunch
+                    .at_stage(BootstrapStage::InstallerWait)
+                    .with_system_code(BootstrapSystemCode::WaitStatus(status));
+                return match terminate_job_and_wait_idle(job.0) {
+                    Ok(()) => Err(error),
+                    Err(termination_error) => Err(error.with_secondary(termination_error)),
+                };
             }
         }
         let mut exit_code = u32::MAX;
         // SAFETY: process is signaled and exit_code is writable.
         if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
-            let _ = terminate_job_and_wait_idle(job.0);
-            return Err(BootstrapError::InstallerLaunch);
+            let error = last_win32_error(
+                BootstrapError::InstallerLaunch,
+                BootstrapStage::InstallerExit,
+            );
+            return match terminate_job_and_wait_idle(job.0) {
+                Ok(()) => Err(error),
+                Err(termination_error) => Err(error.with_secondary(termination_error)),
+            };
         }
         if exit_code != 0 {
-            if !terminate_job_and_wait_idle(job.0) {
-                return Err(BootstrapError::InstallerLaunch);
-            }
-            return Ok(exit_code);
+            let error = BootstrapError::InstallerFailed
+                .at_stage(BootstrapStage::InstallerExit)
+                .with_system_code(BootstrapSystemCode::InstallerExit(exit_code));
+            return match terminate_job_and_wait_idle(job.0) {
+                Ok(()) => Ok(exit_code),
+                Err(termination_error) => Err(error.with_secondary(termination_error)),
+            };
         }
         loop {
             match active_job_processes(job.0) {
                 Ok(0) => break,
                 Ok(_) => {}
-                Err(_) => {
-                    let _ = terminate_job_and_wait_idle(job.0);
-                    return Err(BootstrapError::InstallerLaunch);
+                Err(error) => {
+                    return match terminate_job_and_wait_idle(job.0) {
+                        Ok(()) => Err(error),
+                        Err(termination_error) => Err(error.with_secondary(termination_error)),
+                    };
                 }
             }
             if started.elapsed() >= policy.timeout {
-                if !terminate_job_and_wait_idle(job.0) {
-                    return Err(BootstrapError::InstallerLaunch);
-                }
-                return Err(BootstrapError::InstallerTimeout);
+                let error =
+                    BootstrapError::InstallerTimeout.at_stage(BootstrapStage::InstallerJobDrain);
+                return match terminate_job_and_wait_idle(job.0) {
+                    Ok(()) => Err(error),
+                    Err(termination_error) => Err(error.with_secondary(termination_error)),
+                };
             }
             thread::sleep(
                 JOB_IDLE_POLL_INTERVAL.min(policy.timeout.saturating_sub(started.elapsed())),
@@ -1185,7 +1512,7 @@ impl SilentInstaller for JobControlledInstaller {
 struct ProgressWindow {
     hwnd: isize,
     thread_id: u32,
-    done: mpsc::Receiver<()>,
+    done: mpsc::Receiver<Result<(), BootstrapError>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -1197,7 +1524,13 @@ impl ProgressWindow {
         let join = thread::Builder::new()
             .name("webview2-bootstrap-progress".to_owned())
             .spawn(move || progress_thread(sender, acknowledged, done_sender))
-            .map_err(|_| BootstrapError::ProgressWindow)?;
+            .map_err(|error| {
+                io_error(
+                    BootstrapError::ProgressWindow,
+                    BootstrapStage::ProgressOpen,
+                    &error,
+                )
+            })?;
         match receiver.recv_timeout(PROGRESS_START_TIMEOUT) {
             Ok(Ok((hwnd, thread_id))) if acknowledge.send(()).is_ok() => Ok(Self {
                 hwnd,
@@ -1205,38 +1538,66 @@ impl ProgressWindow {
                 done,
                 join: Some(join),
             }),
-            _ => Err(BootstrapError::ProgressWindow),
+            Ok(Err(error)) => Err(error),
+            _ => Err(BootstrapError::ProgressWindow.at_stage(BootstrapStage::ProgressOpen)),
         }
     }
 
     fn close(mut self) -> Result<(), BootstrapError> {
         // SAFETY: hwnd/thread_id were reported by the live UI thread after queue creation.
         let posted = unsafe { PostMessageW(self.hwnd as _, CLOSE_PROGRESS_MESSAGE, 0, 0) };
+        let mut post_error = None;
         if posted == 0 {
+            let window_post_error = last_win32_error(
+                BootstrapError::ProgressWindow,
+                BootstrapStage::ProgressClose,
+            );
             // SAFETY: WM_QUIT is a safe fallback that prevents an unbounded join.
-            unsafe {
-                PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
+            if unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) } == 0 {
+                post_error = Some(window_post_error.with_secondary(last_win32_error(
+                    BootstrapError::ProgressWindow,
+                    BootstrapStage::ProgressClose,
+                )));
             }
         }
-        if self.done.recv_timeout(PROGRESS_CLOSE_TIMEOUT).is_err() {
-            // SAFETY: Force the UI message loop to return without touching installer state.
-            unsafe {
-                PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
+
+        let thread_result = match self.done.recv_timeout(PROGRESS_CLOSE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => {
+                // SAFETY: Force the UI message loop to return without touching installer state.
+                if unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) } == 0 {
+                    let fallback_error = last_win32_error(
+                        BootstrapError::ProgressWindow,
+                        BootstrapStage::ProgressClose,
+                    );
+                    post_error = Some(match post_error {
+                        Some(error) => error.with_secondary(fallback_error),
+                        None => fallback_error,
+                    });
+                }
+                match self.done.recv_timeout(PROGRESS_CLOSE_FALLBACK_TIMEOUT) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(post_error.unwrap_or(
+                            BootstrapError::ProgressWindow.at_stage(BootstrapStage::ProgressClose),
+                        ));
+                    }
+                }
             }
-            if self
-                .done
-                .recv_timeout(PROGRESS_CLOSE_FALLBACK_TIMEOUT)
-                .is_err()
-            {
-                return Err(BootstrapError::ProgressWindow);
-            }
-        }
-        let Some(join) = self.join.take() else {
-            return Err(BootstrapError::ProgressWindow);
         };
-        match join.join() {
-            Ok(()) => Ok(()),
-            Err(_) => Err(BootstrapError::ProgressWindow),
+        let Some(join) = self.join.take() else {
+            return Err(BootstrapError::ProgressWindow.at_stage(BootstrapStage::ProgressClose));
+        };
+        let joined = join.join();
+        match (thread_result, joined) {
+            (Err(error), Err(_)) => Err(error.with_secondary(
+                BootstrapError::ProgressWindow.at_stage(BootstrapStage::ProgressClose),
+            )),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(_)) => {
+                Err(BootstrapError::ProgressWindow.at_stage(BootstrapStage::ProgressClose))
+            }
+            (Ok(()), Ok(())) => Ok(()),
         }
     }
 }
@@ -1273,20 +1634,22 @@ unsafe extern "system" fn progress_window_proc(
 fn progress_thread(
     sender: SyncSender<Result<(isize, u32), BootstrapError>>,
     acknowledged: mpsc::Receiver<()>,
-    done: SyncSender<()>,
+    done: SyncSender<Result<(), BootstrapError>>,
 ) {
-    run_progress_thread(sender, acknowledged);
-    let _ = done.send(());
+    let result = run_progress_thread(sender, acknowledged);
+    let _ = done.send(result);
 }
 
 fn run_progress_thread(
     sender: SyncSender<Result<(isize, u32), BootstrapError>>,
     acknowledged: mpsc::Receiver<()>,
-) {
-    let result = create_progress_window();
-    let Ok((hwnd, thread_id)) = result else {
-        let _ = sender.send(Err(BootstrapError::ProgressWindow));
-        return;
+) -> Result<(), BootstrapError> {
+    let (hwnd, thread_id) = match create_progress_window() {
+        Ok(window) => window,
+        Err(error) => {
+            let _ = sender.send(Err(error));
+            return Err(error);
+        }
     };
     if sender.send(Ok((hwnd as isize, thread_id))).is_err()
         || acknowledged.recv_timeout(PROGRESS_START_TIMEOUT).is_err()
@@ -1295,7 +1658,7 @@ fn run_progress_thread(
         unsafe {
             DestroyWindow(hwnd);
         }
-        return;
+        return Ok(());
     }
 
     let mut message = MSG::default();
@@ -1308,8 +1671,13 @@ fn run_progress_thread(
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
+        } else if status == 0 {
+            return Ok(());
         } else {
-            break;
+            return Err(last_win32_error(
+                BootstrapError::ProgressWindow,
+                BootstrapStage::ProgressMessageLoop,
+            ));
         }
     }
 }
@@ -1325,12 +1693,15 @@ fn create_progress_window() -> Result<(windows_sys::Win32::Foundation::HWND, u32
     };
     // SAFETY: controls has the documented size and flags.
     if unsafe { InitCommonControlsEx(&mut controls) } == 0 {
-        return Err(BootstrapError::ProgressWindow);
+        return Err(BootstrapError::ProgressWindow.at_stage(BootstrapStage::ProgressOpen));
     }
     // SAFETY: Null requests the current executable module.
     let instance = unsafe { GetModuleHandleW(null()) };
     if instance.is_null() {
-        return Err(BootstrapError::ProgressWindow);
+        return Err(last_win32_error(
+            BootstrapError::ProgressWindow,
+            BootstrapStage::ProgressOpen,
+        ));
     }
     let window_class = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
@@ -1343,10 +1714,16 @@ fn create_progress_window() -> Result<(windows_sys::Win32::Foundation::HWND, u32
         ..WNDCLASSW::default()
     };
     // SAFETY: window_class and all referenced strings live through registration.
-    if unsafe { RegisterClassW(&window_class) } == 0
-        && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
-    {
-        return Err(BootstrapError::ProgressWindow);
+    if unsafe { RegisterClassW(&window_class) } == 0 {
+        // SAFETY: Captured immediately after RegisterClassW returned zero.
+        let code = unsafe { GetLastError() };
+        if code != ERROR_CLASS_ALREADY_EXISTS {
+            return Err(returned_win32_error(
+                BootstrapError::ProgressWindow,
+                BootstrapStage::ProgressOpen,
+                code,
+            ));
+        }
     }
 
     let width = 460;
@@ -1372,7 +1749,10 @@ fn create_progress_window() -> Result<(windows_sys::Win32::Foundation::HWND, u32
         )
     };
     if window.is_null() {
-        return Err(BootstrapError::ProgressWindow);
+        return Err(last_win32_error(
+            BootstrapError::ProgressWindow,
+            BootstrapStage::ProgressOpen,
+        ));
     }
 
     // SAFETY: Creates non-interactive child controls owned by the progress window.
@@ -1393,10 +1773,11 @@ fn create_progress_window() -> Result<(windows_sys::Win32::Foundation::HWND, u32
         )
     };
     if label.is_null() {
+        let error = last_win32_error(BootstrapError::ProgressWindow, BootstrapStage::ProgressOpen);
         unsafe {
             DestroyWindow(window);
         }
-        return Err(BootstrapError::ProgressWindow);
+        return Err(error);
     }
     // SAFETY: Creates a marquee-only progress control with no interaction.
     let progress = unsafe {
@@ -1416,10 +1797,11 @@ fn create_progress_window() -> Result<(windows_sys::Win32::Foundation::HWND, u32
         )
     };
     if progress.is_null() {
+        let error = last_win32_error(BootstrapError::ProgressWindow, BootstrapStage::ProgressOpen);
         unsafe {
             DestroyWindow(window);
         }
-        return Err(BootstrapError::ProgressWindow);
+        return Err(error);
     }
     // SAFETY: DEFAULT_GUI_FONT is a process-lifetime stock object; controls are live.
     let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
@@ -1442,7 +1824,7 @@ struct NativeProgressUi {
 impl ProgressUi for NativeProgressUi {
     fn open(&mut self) -> Result<(), BootstrapError> {
         if self.progress.is_some() {
-            return Err(BootstrapError::ProgressWindow);
+            return Err(BootstrapError::ProgressWindow.at_stage(BootstrapStage::ProgressOpen));
         }
         self.progress = Some(ProgressWindow::open()?);
         Ok(())
@@ -1455,7 +1837,7 @@ impl ProgressUi for NativeProgressUi {
         progress.close()
     }
 
-    fn show_error(&mut self, message: &'static str) -> Result<(), BootstrapError> {
+    fn show_error(&mut self, message: &str) -> Result<(), BootstrapError> {
         let message = wide(message);
         let title = wide(ERROR_TITLE);
         // SAFETY: Both strings are valid for the synchronous native dialog call.
@@ -1468,7 +1850,10 @@ impl ProgressUi for NativeProgressUi {
             )
         };
         if result == 0 {
-            Err(BootstrapError::ProgressWindow)
+            Err(last_win32_error(
+                BootstrapError::ProgressWindow,
+                BootstrapStage::ProgressClose,
+            ))
         } else {
             Ok(())
         }
